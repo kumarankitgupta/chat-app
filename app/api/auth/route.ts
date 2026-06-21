@@ -31,9 +31,11 @@ export async function POST(request: Request) {
   const normalizedName = body.name?.trim().toLowerCase();
   const normalizedStudentId = body.studentId?.trim();
 
+  const isAllowedUser = normalizedName === "bubu" || normalizedName === "buggu";
+
   if (
     body.password !== configuredPassword ||
-    normalizedName !== "buggu" ||
+    !isAllowedUser ||
     normalizedStudentId !== configuredPassword
   ) {
     return NextResponse.json(

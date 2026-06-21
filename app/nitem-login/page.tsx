@@ -15,7 +15,8 @@ export default function NitemLoginPage() {
     const normalizedName = name.trim().toLowerCase();
     const normalizedId = studentId.trim();
 
-    if (normalizedName !== "buggu" || normalizedId !== "bubulovebuggu") {
+    const isAllowedUser = normalizedName === "bubu" || normalizedName === "buggu";
+    if (!isAllowedUser || !normalizedId) {
       setError("Wrong credential");
       return;
     }
@@ -30,7 +31,7 @@ export default function NitemLoginPage() {
         body: JSON.stringify({
           name: normalizedName,
           studentId: normalizedId,
-          password: "bubulovebuggu",
+          password: normalizedId,
         }),
       });
 
@@ -39,7 +40,7 @@ export default function NitemLoginPage() {
         return;
       }
 
-      window.sessionStorage.setItem("private-chat-user", "buggu");
+      window.sessionStorage.setItem("private-chat-user", normalizedName);
       window.location.href = "/chat";
     } catch {
       setError("Could not connect to the server.");
