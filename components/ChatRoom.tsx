@@ -26,6 +26,7 @@ import {
 import { MEDIA_BUCKET, supabase } from "@/lib/supabase/client";
 import MediaViewer from "@/components/MediaViewer";
 import MessageBody from "@/components/MessageBody";
+import { ensurePushSubscription } from "@/lib/push-client";
 import {
   REACTION_EMOJIS,
   type ReactionEmoji,
@@ -1034,6 +1035,14 @@ export default function ChatRoom() {
   }, [senderId]);
 
   useEffect(() => {
+    if (!senderId) {
+      return;
+    }
+
+    void ensurePushSubscription(senderId);
+  }, [senderId]);
+
+  useEffect(() => {
     if (firstUnreadIncomingId) {
       if (unreadDismissTimerRef.current !== null) {
         window.clearTimeout(unreadDismissTimerRef.current);
@@ -1710,20 +1719,16 @@ export default function ChatRoom() {
         reply_to_media_type: replyTo?.media_type ?? null,
       };
 
-      let { error } = await supabase.from("messages").insert(payload);
+      const response = await fetch("/api/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
 
-      if (error && isMissingReplyColumnError(error)) {
-        replyColumnsSupported = false;
-        const { reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type, ...basePayload } = payload;
-        void reply_to_id;
-        void reply_to_sender_name;
-        void reply_to_body;
-        void reply_to_media_type;
-        ({ error } = await supabase.from("messages").insert(basePayload));
-      }
-
-      if (error) {
-        throw error;
+      if (!response.ok) {
+        throw new Error("Could not send message");
       }
 
       forceScrollOnNextUpdateRef.current = true;

@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import {
   COOKIE_MAX_AGE,
+  NITEM_GATE_COOKIE,
   SESSION_COOKIE,
+  createNitemGateToken,
   createSessionToken,
 } from "@/lib/auth";
 
@@ -15,7 +17,7 @@ export async function POST(request: Request) {
     );
   }
 
-  let body: { password?: string };
+  let body: { password?: string; name?: string; studentId?: string };
 
   try {
     body = await request.json();
@@ -26,15 +28,29 @@ export async function POST(request: Request) {
     );
   }
 
-  if (body.password !== configuredPassword) {
+  const normalizedName = body.name?.trim().toLowerCase();
+  const normalizedStudentId = body.studentId?.trim();
+
+  if (
+    body.password !== configuredPassword ||
+    normalizedName !== "buggu" ||
+    normalizedStudentId !== configuredPassword
+  ) {
     return NextResponse.json(
-      { message: "That password does not match." },
+      { message: "Wrong credential" },
       { status: 401 },
     );
   }
 
   const response = NextResponse.json({ ok: true });
   response.cookies.set(SESSION_COOKIE, createSessionToken(), {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: COOKIE_MAX_AGE,
+    path: "/",
+  });
+  response.cookies.set(NITEM_GATE_COOKIE, createNitemGateToken(), {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",

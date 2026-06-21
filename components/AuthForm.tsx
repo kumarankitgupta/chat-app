@@ -30,7 +30,11 @@ export default function AuthForm() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({
+          name: selectedUser,
+          studentId: password,
+          password,
+        }),
       });
 
       if (!response.ok) {

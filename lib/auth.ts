@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
 
 export const SESSION_COOKIE = "private_chat_session";
+export const NITEM_GATE_COOKIE = "nitem_gate_session";
 export const COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
 
 function getSessionSecret() {
@@ -26,6 +27,12 @@ export function createSessionToken() {
   return `${issuedAt}.${sign(issuedAt)}`;
 }
 
+export function createNitemGateToken() {
+  const issuedAt = Date.now().toString();
+  const payload = `nitem.${issuedAt}`;
+  return `${payload}.${sign(payload)}`;
+}
+
 export function isValidSessionToken(token?: string) {
   if (!token) {
     return false;
@@ -40,9 +47,29 @@ export function isValidSessionToken(token?: string) {
   return Number.isFinite(ageInMs) && ageInMs <= COOKIE_MAX_AGE * 1000;
 }
 
+export function isValidNitemGateToken(token?: string) {
+  if (!token) {
+    return false;
+  }
+
+  const [scope, issuedAt, signature] = token.split(".");
+  if (
+    scope !== "nitem" ||
+    !issuedAt ||
+    !signature ||
+    !safeEquals(signature, sign(`${scope}.${issuedAt}`))
+  ) {
+    return false;
+  }
+
+  const ageInMs = Date.now() - Number(issuedAt);
+  return Number.isFinite(ageInMs) && ageInMs <= COOKIE_MAX_AGE * 1000;
+}
+
 export async function isAuthenticated() {
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE)?.value;
+  const nitemGate = cookieStore.get(NITEM_GATE_COOKIE)?.value;
 
-  return isValidSessionToken(token);
+  return isValidSessionToken(token) && isValidNitemGateToken(nitemGate);
 }
