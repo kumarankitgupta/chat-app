@@ -469,11 +469,150 @@ button:disabled {
   border: 0;
   border-radius: 7px;
   box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
+  cursor: default;
   max-width: min(64ch, 72%);
   min-width: 82px;
   overflow: visible;
   padding: 6px 7px 5px;
   position: relative;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message-row.is-reply-highlight .message-bubble {
+  animation: reply-target-flash 0.9s ease;
+}
+
+@keyframes reply-target-flash {
+  0%,
+  100% {
+    filter: none;
+  }
+
+  18%,
+  42% {
+    filter: brightness(0.88);
+  }
+}
+
+.reply-quote {
+  background: rgba(0, 0, 0, 0.05);
+  border: 0;
+  border-left: 3px solid var(--coral);
+  border-radius: 4px;
+  cursor: pointer;
+  display: grid;
+  gap: 1px;
+  margin-bottom: 4px;
+  padding: 4px 8px 4px 6px;
+  text-align: left;
+  width: 100%;
+}
+
+.reply-quote:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.reply-quote:active {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.reply-quote.is-self {
+  border-left-color: #06cf9c;
+}
+
+.reply-quote.is-contact {
+  border-left-color: var(--coral);
+}
+
+.is-mine .reply-quote {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.reply-quote-name {
+  color: var(--coral);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.reply-quote.is-self .reply-quote-name {
+  color: #06cf9c;
+}
+
+.reply-quote-text {
+  color: rgba(17, 27, 33, 0.78);
+  display: -webkit-box;
+  font-size: 0.78rem;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.25;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.reply-preview {
+  align-items: center;
+  background: #f0f2f5;
+  border-top: 1px solid rgba(134, 150, 160, 0.22);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 4px minmax(0, 1fr) 40px;
+  padding: 8px 10px 0;
+}
+
+.reply-preview-bar {
+  align-self: stretch;
+  background: var(--coral);
+  border-radius: 999px;
+  min-height: 42px;
+  width: 4px;
+}
+
+.reply-preview-bar.is-self {
+  background: #06cf9c;
+}
+
+.reply-preview-bar.is-contact {
+  background: var(--coral);
+}
+
+.reply-preview-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding-bottom: 8px;
+}
+
+.reply-preview-copy strong {
+  color: var(--coral);
+  font-size: 0.82rem;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.reply-preview-bar.is-self + .reply-preview-copy strong {
+  color: #06cf9c;
+}
+
+.reply-preview-copy span {
+  color: #667781;
+  display: -webkit-box;
+  font-size: 0.82rem;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.25;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.reply-preview-dismiss {
+  align-self: start;
+  margin-top: 2px;
 }
 
 .is-mine .message-bubble {
@@ -519,6 +658,8 @@ button:disabled {
 
 .message-copy {
   overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
   white-space: pre-wrap;
 }
 

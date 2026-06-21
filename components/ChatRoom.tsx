@@ -37,7 +37,16 @@ type Message = {
   sender_name: string;
   created_at: string;
   read_at: string | null;
+  reply_to_id: string | null;
+  reply_to_sender_name: string | null;
+  reply_to_body: string | null;
+  reply_to_media_type: MediaType | null;
 };
+
+type ReplyTarget = Pick<
+  Message,
+  "id" | "sender_name" | "body" | "media_type"
+>;
 
 type Presence = {
   session_id: string;
@@ -48,6 +57,8 @@ type Presence = {
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const CHAT_USERS = ["bubu", "buggu"] as const;
 const CHAT_USER_STORAGE_KEY = "private-chat-user";
+const DOUBLE_TAP_MS = 320;
+const REPLY_HIGHLIGHT_MS = 900;
 
 type ChatUser = (typeof CHAT_USERS)[number];
 
@@ -96,9 +107,37 @@ function sortMessages(messages: Message[]) {
   );
 }
 
+function getMessagePreview(message: Pick<Message, "body" | "media_type">) {
+  if (message.body?.trim()) {
+    return message.body.trim();
+  }
+
+  if (message.media_type === "image") {
+    return "Photo";
+  }
+
+  if (message.media_type === "video") {
+    return "Video";
+  }
+
+  return "Message";
+}
+
+function toReplyTarget(message: Message): ReplyTarget {
+  return {
+    id: message.id,
+    sender_name: message.sender_name,
+    body: message.body,
+    media_type: message.media_type,
+  };
+}
+
 function isUploadableMedia(file: File) {
   return file.type.startsWith("image/") || file.type.startsWith("video/");
 }
+
+const MESSAGE_SELECT =
+  "id, body, media_url, media_path, media_type, sender_id, sender_name, created_at, read_at, reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type";
 
 const SCROLL_BOTTOM_THRESHOLD = 80;
 
@@ -143,7 +182,9 @@ function messagesAreEqual(current: Message[], next: Message[]) {
       message.body === other.body &&
       message.read_at === other.read_at &&
       message.media_url === other.media_url &&
-      message.created_at === other.created_at
+      message.created_at === other.created_at &&
+      message.reply_to_id === other.reply_to_id &&
+      message.reply_to_body === other.reply_to_body
     );
   });
 }
@@ -167,7 +208,12 @@ export default function ChatRoom() {
     type: MediaType;
     alt?: string;
   } | null>(null);
+  const [replyTo, setReplyTo] = useState<ReplyTarget | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
+    null,
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const startRef = useRef<HTMLDivElement | null>(null);
@@ -183,6 +229,10 @@ export default function ChatRoom() {
   const forceScrollOnNextUpdateRef = useRef(false);
   const wasLoadingRef = useRef(true);
   const lastSeenLatestMessageIdRef = useRef<string | null>(null);
+  const lastTapRef = useRef<{ id: string; time: number } | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+  const hasMoreMessagesRef = useRef(false);
+  const isJumpingToMessageRef = useRef(false);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -209,10 +259,7 @@ export default function ChatRoom() {
   const fetchMessages = useCallback(async () => {
     const { data, error, count } = await supabase
       .from("messages")
-      .select(
-        "id, body, media_url, media_path, media_type, sender_id, sender_name, created_at, read_at",
-        { count: "exact" },
-      )
+      .select(MESSAGE_SELECT, { count: "exact" })
       .in("sender_id", [...CHAT_USERS])
       .order("created_at", { ascending: false })
       .limit(50);
@@ -258,9 +305,7 @@ export default function ChatRoom() {
 
     const { data, error } = await supabase
       .from("messages")
-      .select(
-        "id, body, media_url, media_path, media_type, sender_id, sender_name, created_at, read_at",
-      )
+      .select(MESSAGE_SELECT)
       .in("sender_id", [...CHAT_USERS])
       .lt("created_at", oldestTimestamp)
       .order("created_at", { ascending: true })
@@ -360,6 +405,10 @@ export default function ChatRoom() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    hasMoreMessagesRef.current = hasMoreMessages;
+  }, [hasMoreMessages]);
 
   useEffect(() => {
     if (!senderId) {
@@ -483,6 +532,12 @@ export default function ChatRoom() {
       return;
     }
 
+    if (isJumpingToMessageRef.current) {
+      isJumpingToMessageRef.current = false;
+      isPrependingOlderRef.current = false;
+      return;
+    }
+
     if (isPrependingOlderRef.current) {
       isPrependingOlderRef.current = false;
       return;
@@ -601,6 +656,147 @@ export default function ChatRoom() {
   }, [hasMoreMessages, isLoadingOlder, fetchOlderMessages, isMounted]);
 
   useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  function flashMessage(messageId: string) {
+    setHighlightedMessageId(messageId);
+
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedMessageId(null);
+      highlightTimerRef.current = null;
+    }, REPLY_HIGHLIGHT_MS);
+  }
+
+  async function loadOlderBatchForJump() {
+    const current = messagesRef.current;
+    if (!current.length || !hasMoreMessagesRef.current) {
+      return false;
+    }
+
+    const oldestTimestamp = current[0].created_at;
+    const { data, error } = await supabase
+      .from("messages")
+      .select(MESSAGE_SELECT)
+      .in("sender_id", [...CHAT_USERS])
+      .lt("created_at", oldestTimestamp)
+      .order("created_at", { ascending: true })
+      .limit(50);
+
+    if (error) {
+      console.error("Error fetching older messages:", error);
+      return false;
+    }
+
+    if (!data?.length) {
+      setHasMoreMessages(false);
+      hasMoreMessagesRef.current = false;
+      return false;
+    }
+
+    isJumpingToMessageRef.current = true;
+    isPrependingOlderRef.current = true;
+    stickToBottomRef.current = false;
+    isViewingHistoryRef.current = true;
+
+    const merged = sortMessages([...(data as Message[]), ...current]);
+    messagesRef.current = merged;
+    setMessages(merged);
+
+    const hasMore = data.length === 50;
+    setHasMoreMessages(hasMore);
+    hasMoreMessagesRef.current = hasMore;
+
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+
+    return true;
+  }
+
+  function scrollToMessageElement(messageId: string) {
+    const container = messageListRef.current;
+    if (!container) {
+      return false;
+    }
+
+    const target = container.querySelector<HTMLElement>(
+      `[data-message-id="${messageId}"]`,
+    );
+
+    if (!target) {
+      return false;
+    }
+
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    flashMessage(messageId);
+    return true;
+  }
+
+  async function goToQuotedMessage(messageId: string) {
+    if (messagesRef.current.some((message) => message.id === messageId)) {
+      scrollToMessageElement(messageId);
+      return;
+    }
+
+    let attempts = 0;
+    while (
+      !messagesRef.current.some((message) => message.id === messageId) &&
+      hasMoreMessagesRef.current &&
+      attempts < 20
+    ) {
+      const loaded = await loadOlderBatchForJump();
+      if (!loaded) {
+        break;
+      }
+      attempts += 1;
+    }
+
+    if (!messagesRef.current.some((message) => message.id === messageId)) {
+      setNotice("Original message is no longer available.");
+      return;
+    }
+
+    scrollToMessageElement(messageId);
+  }
+
+  function startReply(message: Message) {
+    setReplyTo(toReplyTarget(message));
+    flashMessage(message.id);
+
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+  }
+
+  function handleMessageActivate(message: Message) {
+    const now = Date.now();
+    const lastTap = lastTapRef.current;
+
+    if (lastTap?.id === message.id && now - lastTap.time <= DOUBLE_TAP_MS) {
+      lastTapRef.current = null;
+      startReply(message);
+      return;
+    }
+
+    lastTapRef.current = { id: message.id, time: now };
+  }
+
+  function clearReply() {
+    setReplyTo(null);
+  }
+
+  useEffect(() => {
     if (!selectedFile) {
       setPreviewUrl("");
       return;
@@ -699,6 +895,10 @@ export default function ChatRoom() {
         media_type: media?.mediaType ?? null,
         sender_id: senderId,
         sender_name: senderName,
+        reply_to_id: replyTo?.id ?? null,
+        reply_to_sender_name: replyTo?.sender_name ?? null,
+        reply_to_body: replyTo ? getMessagePreview(replyTo) : null,
+        reply_to_media_type: replyTo?.media_type ?? null,
       });
 
       if (error) {
@@ -711,6 +911,7 @@ export default function ChatRoom() {
 
       setText("");
       setSelectedFile(null);
+      setReplyTo(null);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
@@ -847,12 +1048,50 @@ export default function ChatRoom() {
 
               return (
                 <article
-                  className={`message-row ${isMine ? "is-mine" : "is-theirs"}`}
+                  className={`message-row ${isMine ? "is-mine" : "is-theirs"} ${
+                    highlightedMessageId === message.id ? "is-reply-highlight" : ""
+                  }`}
+                  data-message-id={message.id}
                   key={message.id}
                 >
-                  <div className="message-bubble">
+                  <div
+                    className="message-bubble"
+                    onDoubleClick={() => startReply(message)}
+                    onTouchEnd={() => handleMessageActivate(message)}
+                  >
                     {!isMine ? (
                       <div className="sender-name">{message.sender_name}</div>
+                    ) : null}
+
+                    {message.reply_to_id && message.reply_to_sender_name ? (
+                      <button
+                        aria-label={`Go to message from ${message.reply_to_sender_name}`}
+                        className={`reply-quote ${
+                          message.reply_to_sender_name === senderName
+                            ? "is-self"
+                            : "is-contact"
+                        }`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void goToQuotedMessage(message.reply_to_id!);
+                        }}
+                        onTouchEnd={(event) => {
+                          event.stopPropagation();
+                        }}
+                        type="button"
+                      >
+                        <span className="reply-quote-name">
+                          {message.reply_to_sender_name}
+                        </span>
+                        <span className="reply-quote-text">
+                          {message.reply_to_body ??
+                            (message.reply_to_media_type === "image"
+                              ? "Photo"
+                              : message.reply_to_media_type === "video"
+                                ? "Video"
+                                : "Message")}
+                        </span>
+                      </button>
                     ) : null}
 
                     {message.media_url && message.media_type ? (
@@ -940,6 +1179,28 @@ export default function ChatRoom() {
           </div>
         ) : null}
 
+        {replyTo ? (
+          <div className="reply-preview">
+            <div
+              className={`reply-preview-bar ${
+                replyTo.sender_name === senderName ? "is-self" : "is-contact"
+              }`}
+            />
+            <div className="reply-preview-copy">
+              <strong>{replyTo.sender_name}</strong>
+              <span>{getMessagePreview(replyTo)}</span>
+            </div>
+            <button
+              aria-label="Cancel reply"
+              className="icon-button reply-preview-dismiss"
+              onClick={clearReply}
+              type="button"
+            >
+              <X size={18} />
+            </button>
+          </div>
+        ) : null}
+
         <form className="composer" onSubmit={handleSend}>
           <input
             ref={fileInputRef}
@@ -961,12 +1222,19 @@ export default function ChatRoom() {
             aria-label="Message"
             onChange={(event) => setText(event.target.value)}
             onKeyDown={(event) => {
+              if (event.key === "Escape" && replyTo) {
+                event.preventDefault();
+                clearReply();
+                return;
+              }
+
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
             }}
-            placeholder="Write a message"
+            placeholder={replyTo ? "Reply..." : "Write a message"}
+            ref={textareaRef}
             rows={1}
             value={text}
           />

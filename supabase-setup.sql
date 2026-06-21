@@ -9,7 +9,14 @@ create table if not exists public.messages (
   sender_id text not null check (sender_id in ('bubu', 'buggu')),
   sender_name text not null default 'bubu' check (sender_name in ('bubu', 'buggu')),
   created_at timestamptz not null default now(),
-  read_at timestamptz
+  read_at timestamptz,
+  reply_to_id uuid references public.messages (id) on delete set null,
+  reply_to_sender_name text,
+  reply_to_body text,
+  reply_to_media_type text check (
+    reply_to_media_type is null
+    or reply_to_media_type in ('image', 'video')
+  )
 );
 
 alter table public.messages enable row level security;
@@ -139,6 +146,30 @@ end $$;
 do $$
 begin
   alter publication supabase_realtime add table public.chat_presence;
+exception
+  when duplicate_object then null;
+end $$;
+
+alter table public.messages
+add column if not exists reply_to_id uuid references public.messages (id) on delete set null;
+
+alter table public.messages
+add column if not exists reply_to_sender_name text;
+
+alter table public.messages
+add column if not exists reply_to_body text;
+
+alter table public.messages
+add column if not exists reply_to_media_type text;
+
+do $$
+begin
+  alter table public.messages
+  add constraint messages_reply_media_type_check
+  check (
+    reply_to_media_type is null
+    or reply_to_media_type in ('image', 'video')
+  );
 exception
   when duplicate_object then null;
 end $$;
