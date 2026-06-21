@@ -2,6 +2,7 @@
 
 import {
   ChangeEvent,
+  Fragment,
   FormEvent,
   useCallback,
   useEffect,
@@ -24,6 +25,11 @@ import {
 } from "lucide-react";
 import { MEDIA_BUCKET, supabase } from "@/lib/supabase/client";
 import MediaViewer from "@/components/MediaViewer";
+import MessageBody from "@/components/MessageBody";
+import {
+  REACTION_EMOJIS,
+  type ReactionEmoji,
+} from "@/components/MessageBody";
 
 type MediaType = "image" | "video";
 
@@ -52,13 +58,32 @@ type Presence = {
   session_id: string;
   display_name: string;
   last_seen: string;
+  is_typing?: boolean;
+  typing_updated_at?: string | null;
 };
+
+type MessageReaction = {
+  id: string;
+  message_id: string;
+  user_id: string;
+  emoji: ReactionEmoji;
+  created_at: string;
+};
+
+type TimelineItem =
+  | { type: "date"; key: string; label: string }
+  | { type: "message"; message: Message };
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const CHAT_USERS = ["bubu", "buggu"] as const;
 const CHAT_USER_STORAGE_KEY = "private-chat-user";
 const DOUBLE_TAP_MS = 320;
 const REPLY_HIGHLIGHT_MS = 900;
+const TYPING_TTL_MS = 4000;
+const TYPING_CLEAR_MS = 2000;
+const TYPING_PING_MS = 2500;
+const LONG_PRESS_MS = 500;
+const UNREAD_DISMISS_MS = 2200;
 
 type ChatUser = (typeof CHAT_USERS)[number];
 
@@ -85,9 +110,117 @@ function formatFullDateTime(value: string) {
   }).format(new Date(value));
 }
 
+function isSameCalendarDay(a: Date, b: Date) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function formatDateSeparator(value: string) {
+  const date = new Date(value);
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  if (isSameCalendarDay(date, now)) {
+    return "Today";
+  }
+
+  if (isSameCalendarDay(date, yesterday)) {
+    return "Yesterday";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    ...(date.getFullYear() !== now.getFullYear() ? { year: "numeric" as const } : {}),
+  }).format(date);
+}
+
+function buildMessageTimeline(messages: Message[]): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  let lastDateKey = "";
+
+  for (const message of messages) {
+    const dateKey = message.created_at.slice(0, 10);
+    if (dateKey !== lastDateKey) {
+      items.push({
+        type: "date",
+        key: `date-${dateKey}`,
+        label: formatDateSeparator(message.created_at),
+      });
+      lastDateKey = dateKey;
+    }
+
+    items.push({ type: "message", message });
+  }
+
+  return items;
+}
+
+function isPresenceTyping(
+  presence?: Pick<Presence, "is_typing" | "typing_updated_at">,
+) {
+  if (!presence?.is_typing || !presence.typing_updated_at) {
+    return false;
+  }
+
+  return (
+    Date.now() - new Date(presence.typing_updated_at).getTime() < TYPING_TTL_MS
+  );
+}
+
+function groupReactions(reactions: MessageReaction[]) {
+  const grouped = new Map<
+    ReactionEmoji,
+    { emoji: ReactionEmoji; users: string[] }
+  >();
+
+  for (const reaction of reactions) {
+    const existing = grouped.get(reaction.emoji);
+    if (existing) {
+      existing.users.push(reaction.user_id);
+    } else {
+      grouped.set(reaction.emoji, {
+        emoji: reaction.emoji,
+        users: [reaction.user_id],
+      });
+    }
+  }
+
+  return [...grouped.values()];
+}
+
+function applyPresenceUpdate(current: Presence[], next: Presence) {
+  const previous = current.find(
+    (presence) => presence.session_id === next.session_id,
+  );
+
+  if (
+    previous &&
+    previous.last_seen === next.last_seen &&
+    previous.is_typing === next.is_typing &&
+    previous.typing_updated_at === next.typing_updated_at
+  ) {
+    return current;
+  }
+
+  return [
+    ...current.filter((presence) => presence.session_id !== next.session_id),
+    next,
+  ];
+}
+
 function getContactStatus(presence?: Presence) {
   if (!presence) {
     return "last seen not available yet";
+  }
+
+  if (isPresenceTyping(presence)) {
+    return "typing...";
   }
 
   const secondsSinceSeen =
@@ -190,6 +323,8 @@ const MESSAGE_SELECT_BASE =
 const MESSAGE_SELECT_WITH_REPLY = `${MESSAGE_SELECT_BASE}, reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type`;
 
 let replyColumnsSupported: boolean | null = null;
+let typingColumnsSupported: boolean | null = null;
+let reactionsTableSupported: boolean | null = null;
 
 function normalizeMessage(raw: Partial<Message> & Pick<Message, "id" | "created_at" | "sender_id" | "sender_name">): Message {
   return {
@@ -387,7 +522,7 @@ export default function ChatRoom() {
   const [senderName, setSenderName] = useState<ChatUser | "">("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [presences, setPresences] = useState<Presence[]>([]);
-  const [text, setText] = useState("");
+  const [hasDraftText, setHasDraftText] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -402,6 +537,10 @@ export default function ChatRoom() {
     alt?: string;
   } | null>(null);
   const [replyTo, setReplyTo] = useState<ReplyTarget | null>(null);
+  const [reactions, setReactions] = useState<MessageReaction[]>([]);
+  const [reactionPickerId, setReactionPickerId] = useState<string | null>(null);
+  const [statusTick, setStatusTick] = useState(0);
+  const [activeUnreadMarkerId, setActiveUnreadMarkerId] = useState<string | null>(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
     null,
   );
@@ -426,6 +565,15 @@ export default function ChatRoom() {
   const highlightTimerRef = useRef<number | null>(null);
   const hasMoreMessagesRef = useRef(false);
   const isJumpingToMessageRef = useRef(false);
+  const typingTimerRef = useRef<number | null>(null);
+  const typingPingTimerRef = useRef<number | null>(null);
+  const lastTypingPingRef = useRef(0);
+  const isTypingActiveRef = useRef(false);
+  const senderIdRef = useRef(senderId);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressTriggeredRef = useRef(false);
+  const draftTextRef = useRef("");
+  const unreadDismissTimerRef = useRef<number | null>(null);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -446,8 +594,46 @@ export default function ChatRoom() {
 
   const contactStatus = useMemo(
     () => getContactStatus(latestOtherPresence),
-    [latestOtherPresence],
+    [latestOtherPresence, statusTick],
   );
+
+  const messageTimeline = useMemo(
+    () => buildMessageTimeline(messages),
+    [messages],
+  );
+
+  const reactionsByMessageId = useMemo(() => {
+    const map = new Map<string, MessageReaction[]>();
+
+    for (const reaction of reactions) {
+      const current = map.get(reaction.message_id) ?? [];
+      current.push(reaction);
+      map.set(reaction.message_id, current);
+    }
+
+    return map;
+  }, [reactions]);
+
+  const firstUnreadIncomingId = useMemo(() => {
+    if (!senderId) {
+      return null;
+    }
+
+    return (
+      messages.find(
+        (message) => message.sender_id !== senderId && !message.read_at,
+      )?.id ?? null
+    );
+  }, [messages, senderId]);
+
+  const unreadAnchorTimestamp = useMemo(() => {
+    if (!activeUnreadMarkerId) {
+      return null;
+    }
+
+    const anchor = messages.find((message) => message.id === activeUnreadMarkerId);
+    return anchor ? new Date(anchor.created_at).getTime() : null;
+  }, [activeUnreadMarkerId, messages]);
 
   const fetchMessages = useCallback(async (options?: { fullHistory?: boolean }) => {
     if (options?.fullHistory) {
@@ -541,29 +727,271 @@ export default function ChatRoom() {
   }, [messages, isLoadingOlder]);
 
   const fetchPresences = useCallback(async () => {
-    const { data } = await supabase
+    const withTyping = await supabase
+      .from("chat_presence")
+      .select("session_id, display_name, last_seen, is_typing, typing_updated_at")
+      .in("session_id", [...CHAT_USERS])
+      .order("last_seen", { ascending: false })
+      .limit(20);
+
+    if (!withTyping.error) {
+      typingColumnsSupported = true;
+      setPresences((withTyping.data ?? []) as Presence[]);
+      return;
+    }
+
+    if (
+      withTyping.error.code === "42703" ||
+      withTyping.error.message?.includes("is_typing")
+    ) {
+      typingColumnsSupported = false;
+    } else {
+      return;
+    }
+
+    const base = await supabase
       .from("chat_presence")
       .select("session_id, display_name, last_seen")
       .in("session_id", [...CHAT_USERS])
       .order("last_seen", { ascending: false })
       .limit(20);
 
-    setPresences((data ?? []) as Presence[]);
+    setPresences((base.data ?? []) as Presence[]);
+  }, []);
+
+  const fetchReactions = useCallback(async () => {
+    if (reactionsTableSupported === false) {
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("message_reactions")
+      .select("id, message_id, user_id, emoji, created_at")
+      .in("user_id", [...CHAT_USERS]);
+
+    if (error) {
+      if (error.code === "42P01" || error.message?.includes("message_reactions")) {
+        reactionsTableSupported = false;
+        setNotice(
+          "Reactions need supabase-features-migration.sql. Run it in Supabase, then refresh.",
+        );
+      }
+      return;
+    }
+
+    reactionsTableSupported = true;
+    setReactions((data ?? []) as MessageReaction[]);
   }, []);
 
   const updatePresence = useCallback(
-    async () => {
+    async (options?: { isTyping?: boolean }) => {
       if (!senderId || !senderName) {
         return;
       }
 
-      await supabase.from("chat_presence").upsert({
+      const payload: Record<string, string | boolean> = {
         session_id: senderId,
         display_name: senderName,
         last_seen: new Date().toISOString(),
-      });
+      };
+
+      if (typingColumnsSupported !== false && options?.isTyping !== undefined) {
+        payload.is_typing = options.isTyping;
+        payload.typing_updated_at = new Date().toISOString();
+      }
+
+      const withTyping = await supabase.from("chat_presence").upsert(payload);
+
+      if (
+        withTyping.error &&
+        (withTyping.error.code === "42703" ||
+          withTyping.error.message?.includes("is_typing"))
+      ) {
+        typingColumnsSupported = false;
+        const { is_typing, typing_updated_at, ...basePayload } = payload;
+        void is_typing;
+        void typing_updated_at;
+        await supabase.from("chat_presence").upsert(basePayload);
+      }
     },
     [senderId, senderName],
+  );
+
+  const clearTyping = useCallback(async () => {
+    if (!senderId || typingColumnsSupported === false) {
+      return;
+    }
+
+    isTypingActiveRef.current = false;
+    lastTypingPingRef.current = 0;
+
+    if (typingPingTimerRef.current !== null) {
+      window.clearTimeout(typingPingTimerRef.current);
+      typingPingTimerRef.current = null;
+    }
+
+    await supabase
+      .from("chat_presence")
+      .update({
+        is_typing: false,
+        typing_updated_at: new Date().toISOString(),
+      })
+      .eq("session_id", senderId);
+  }, [senderId]);
+
+  const pingTyping = useCallback(() => {
+    if (!senderId || typingColumnsSupported === false) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastTypingPingRef.current < TYPING_PING_MS) {
+      return;
+    }
+
+    lastTypingPingRef.current = now;
+
+    if (!isTypingActiveRef.current) {
+      isTypingActiveRef.current = true;
+      void updatePresence({ isTyping: true });
+      return;
+    }
+
+    void supabase
+      .from("chat_presence")
+      .update({
+        is_typing: true,
+        typing_updated_at: new Date().toISOString(),
+      })
+      .eq("session_id", senderId);
+  }, [senderId, updatePresence]);
+
+  const queueTypingSignal = useCallback(() => {
+    if (!senderId || typingColumnsSupported === false) {
+      return;
+    }
+
+    if (typingTimerRef.current !== null) {
+      window.clearTimeout(typingTimerRef.current);
+    }
+
+    typingTimerRef.current = window.setTimeout(() => {
+      void clearTyping();
+      typingTimerRef.current = null;
+    }, TYPING_CLEAR_MS);
+
+    if (typingPingTimerRef.current !== null) {
+      return;
+    }
+
+    pingTyping();
+
+    typingPingTimerRef.current = window.setTimeout(() => {
+      typingPingTimerRef.current = null;
+      if (isTypingActiveRef.current) {
+        pingTyping();
+      }
+    }, TYPING_PING_MS);
+  }, [clearTyping, pingTyping, senderId]);
+
+  const toggleReaction = useCallback(
+    async (messageId: string, emoji: ReactionEmoji) => {
+      if (!senderId) {
+        return;
+      }
+
+      if (reactionsTableSupported === false) {
+        setNotice(
+          "Reactions need supabase-features-migration.sql. Run it in Supabase, then refresh.",
+        );
+        return;
+      }
+
+      const existing = reactions.find(
+        (reaction) =>
+          reaction.message_id === messageId && reaction.user_id === senderId,
+      );
+
+      if (existing?.emoji === emoji) {
+        setReactions((current) =>
+          current.filter((reaction) => reaction.id !== existing.id),
+        );
+
+        const { error } = await supabase
+          .from("message_reactions")
+          .delete()
+          .eq("id", existing.id);
+
+        if (error) {
+          setReactions((current) => [...current, existing]);
+          setNotice("Could not remove reaction. Try again.");
+        }
+        return;
+      }
+
+      const previous = existing ?? null;
+      const optimistic: MessageReaction = {
+        id: existing?.id ?? `optimistic-${messageId}-${senderId}`,
+        message_id: messageId,
+        user_id: senderId,
+        emoji,
+        created_at: existing?.created_at ?? new Date().toISOString(),
+      };
+
+      setReactions((current) => [
+        ...current.filter(
+          (reaction) =>
+            !(reaction.message_id === messageId && reaction.user_id === senderId),
+        ),
+        optimistic,
+      ]);
+
+      const { data, error } = await supabase
+        .from("message_reactions")
+        .upsert(
+          {
+            message_id: messageId,
+            user_id: senderId,
+            emoji,
+          },
+          { onConflict: "message_id,user_id" },
+        )
+        .select("id, message_id, user_id, emoji, created_at")
+        .single();
+
+      if (error) {
+        setReactions((current) => {
+          const withoutOptimistic = current.filter(
+            (reaction) => reaction.id !== optimistic.id,
+          );
+          return previous ? [...withoutOptimistic, previous] : withoutOptimistic;
+        });
+
+        if (error.code === "42P01" || error.message?.includes("message_reactions")) {
+          reactionsTableSupported = false;
+          setNotice(
+            "Reactions need supabase-features-migration.sql. Run it in Supabase, then refresh.",
+          );
+        } else {
+          setNotice("Could not save reaction. Try again.");
+        }
+        return;
+      }
+
+      reactionsTableSupported = true;
+      if (data) {
+        setReactions((current) => [
+          ...current.filter(
+            (reaction) =>
+              !(
+                reaction.message_id === messageId && reaction.user_id === senderId
+              ),
+          ),
+          data as MessageReaction,
+        ]);
+      }
+    },
+    [reactions, senderId],
   );
 
   const markMessagesRead = useCallback(
@@ -602,6 +1030,34 @@ export default function ChatRoom() {
   }, []);
 
   useEffect(() => {
+    senderIdRef.current = senderId;
+  }, [senderId]);
+
+  useEffect(() => {
+    if (firstUnreadIncomingId) {
+      if (unreadDismissTimerRef.current !== null) {
+        window.clearTimeout(unreadDismissTimerRef.current);
+        unreadDismissTimerRef.current = null;
+      }
+      setActiveUnreadMarkerId(firstUnreadIncomingId);
+      return;
+    }
+
+    if (!activeUnreadMarkerId) {
+      return;
+    }
+
+    if (unreadDismissTimerRef.current !== null) {
+      window.clearTimeout(unreadDismissTimerRef.current);
+    }
+
+    unreadDismissTimerRef.current = window.setTimeout(() => {
+      setActiveUnreadMarkerId(null);
+      unreadDismissTimerRef.current = null;
+    }, UNREAD_DISMISS_MS);
+  }, [activeUnreadMarkerId, firstUnreadIncomingId]);
+
+  useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
@@ -627,6 +1083,7 @@ export default function ChatRoom() {
         fetchPresences(),
         updatePresence(),
       ]);
+      void fetchReactions();
       if (isMounted) {
         setIsLoading(false);
       }
@@ -669,8 +1126,61 @@ export default function ChatRoom() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "chat_presence" },
-        () => {
-          void fetchPresences();
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            void fetchPresences();
+            return;
+          }
+
+          const row = payload.new as Presence;
+          if (!row?.session_id) {
+            return;
+          }
+
+          if (row.session_id === senderIdRef.current) {
+            return;
+          }
+
+          setPresences((current) => applyPresenceUpdate(current, row));
+        },
+      )
+      .subscribe();
+
+    const reactionsChannel = supabase
+      .channel("private-chat-reactions")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "message_reactions" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const inserted = payload.new as MessageReaction;
+            setReactions((current) => [
+              ...current.filter(
+                (reaction) =>
+                  !(
+                    reaction.message_id === inserted.message_id &&
+                    reaction.user_id === inserted.user_id
+                  ),
+              ),
+              inserted,
+            ]);
+          }
+
+          if (payload.eventType === "UPDATE") {
+            const updated = payload.new as MessageReaction;
+            setReactions((current) =>
+              current.map((reaction) =>
+                reaction.id === updated.id ? updated : reaction,
+              ),
+            );
+          }
+
+          if (payload.eventType === "DELETE") {
+            const deleted = payload.old as { id: string };
+            setReactions((current) =>
+              current.filter((reaction) => reaction.id !== deleted.id),
+            );
+          }
         },
       )
       .subscribe();
@@ -700,14 +1210,76 @@ export default function ChatRoom() {
       window.removeEventListener("focus", handleVisibility);
       void supabase.removeChannel(messagesChannel);
       void supabase.removeChannel(presenceChannel);
+      void supabase.removeChannel(reactionsChannel);
     };
   }, [
     fetchMessages,
     fetchPresences,
+    fetchReactions,
     markMessagesRead,
     senderId,
     updatePresence,
   ]);
+
+  useEffect(() => {
+    if (!latestOtherPresence?.is_typing) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setStatusTick((tick) => tick + 1);
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [latestOtherPresence?.is_typing, latestOtherPresence?.session_id]);
+
+  useEffect(() => {
+    if (!reactionPickerId) {
+      return;
+    }
+
+    const closePicker = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".reaction-picker")
+      ) {
+        return;
+      }
+      setReactionPickerId(null);
+    };
+
+    const timer = window.setTimeout(() => {
+      document.addEventListener("pointerdown", closePicker);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("pointerdown", closePicker);
+    };
+  }, [reactionPickerId]);
+
+  useEffect(() => {
+    void fetchReactions();
+  }, [fetchReactions, senderId]);
+
+  useEffect(() => {
+    return () => {
+      if (typingTimerRef.current !== null) {
+        window.clearTimeout(typingTimerRef.current);
+      }
+      if (typingPingTimerRef.current !== null) {
+        window.clearTimeout(typingPingTimerRef.current);
+      }
+      if (longPressTimerRef.current !== null) {
+        window.clearTimeout(longPressTimerRef.current);
+      }
+      if (unreadDismissTimerRef.current !== null) {
+        window.clearTimeout(unreadDismissTimerRef.current);
+      }
+      void clearTyping();
+    };
+  }, [clearTyping]);
 
   useEffect(() => {
     void markMessagesRead(messages);
@@ -978,6 +1550,11 @@ export default function ChatRoom() {
   }
 
   function handleMessageActivate(message: Message) {
+    if (longPressTriggeredRef.current) {
+      longPressTriggeredRef.current = false;
+      return;
+    }
+
     const now = Date.now();
     const lastTap = lastTapRef.current;
 
@@ -992,6 +1569,33 @@ export default function ChatRoom() {
 
   function clearReply() {
     setReplyTo(null);
+  }
+
+  function handleBubblePointerDown(message: Message) {
+    longPressTriggeredRef.current = false;
+    longPressTimerRef.current = window.setTimeout(() => {
+      longPressTriggeredRef.current = true;
+      setReactionPickerId(message.id);
+    }, LONG_PRESS_MS);
+  }
+
+  function handleBubblePointerUp() {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function handleTextChange(value: string) {
+    draftTextRef.current = value;
+    const nextHasDraft = value.trim().length > 0;
+    setHasDraftText((current) => (current === nextHasDraft ? current : nextHasDraft));
+
+    if (value.trim()) {
+      queueTypingSignal();
+    } else {
+      void clearTyping();
+    }
   }
 
   useEffect(() => {
@@ -1013,6 +1617,10 @@ export default function ChatRoom() {
     setMessages([]);
     setHasMoreMessages(false);
     setReplyTo(null);
+    setReactions([]);
+    setReactionPickerId(null);
+    draftTextRef.current = "";
+    setHasDraftText(false);
     setSenderId(user);
     setSenderName(user);
   }
@@ -1068,7 +1676,7 @@ export default function ChatRoom() {
   async function handleSend(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    const body = text.trim();
+    const body = draftTextRef.current.trim();
     if (!body && !selectedFile) {
       return;
     }
@@ -1122,9 +1730,14 @@ export default function ChatRoom() {
       stickToBottomRef.current = true;
       isViewingHistoryRef.current = false;
 
-      setText("");
+      draftTextRef.current = "";
+      setHasDraftText(false);
       setSelectedFile(null);
       setReplyTo(null);
+      void clearTyping();
+      if (textareaRef.current) {
+        textareaRef.current.value = "";
+      }
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
@@ -1190,7 +1803,9 @@ export default function ChatRoom() {
             </div>
             <div className="contact-copy">
               <h1>{contactName}</h1>
-              <p>{contactStatus}</p>
+              <p className={contactStatus === "typing..." ? "is-typing" : undefined}>
+                {contactStatus}
+              </p>
             </div>
           </div>
           <div className="header-actions">
@@ -1228,9 +1843,26 @@ export default function ChatRoom() {
               Loading chat
             </div>
           ) : messages.length ? (
-            messages.map((message) => {
+            messageTimeline.map((item) => {
+              if (item.type === "date") {
+                return (
+                  <div className="date-separator" key={item.key}>
+                    <span>{item.label}</span>
+                  </div>
+                );
+              }
+
+              const message = item.message;
               const isMine = message.sender_id === senderId;
               const isEmojiOnly = isSingleEmojiMessage(message);
+              const messageReactions = reactionsByMessageId.get(message.id) ?? [];
+              const reactionGroups = groupReactions(messageReactions);
+              const isUnreadHighlight =
+                !isMine &&
+                ((firstUnreadIncomingId !== null && !message.read_at) ||
+                  (firstUnreadIncomingId === null &&
+                    unreadAnchorTimestamp !== null &&
+                    new Date(message.created_at).getTime() >= unreadAnchorTimestamp));
               const messageMeta = (
                 <span className="message-meta">
                   <time dateTime={message.created_at}>
@@ -1261,22 +1893,59 @@ export default function ChatRoom() {
               );
 
               return (
-                <article
-                  className={`message-row ${isMine ? "is-mine" : "is-theirs"} ${
-                    isEmojiOnly ? "is-single-emoji" : ""
-                  } ${
-                    highlightedMessageId === message.id ? "is-reply-highlight" : ""
-                  }`}
-                  data-message-id={message.id}
-                  key={message.id}
-                >
-                  <div
-                    className={`message-bubble ${
-                      isEmojiOnly ? "message-emoji-only" : ""
+                <Fragment key={message.id}>
+                  {activeUnreadMarkerId === message.id ? (
+                    <div className="unread-separator">
+                      <span>Unread messages</span>
+                    </div>
+                  ) : null}
+                  <article
+                    className={`message-row ${isMine ? "is-mine" : "is-theirs"} ${
+                      isEmojiOnly ? "is-single-emoji" : ""
+                    } ${
+                      highlightedMessageId === message.id ? "is-reply-highlight" : ""
+                    } ${reactionGroups.length ? "has-reactions" : ""} ${
+                      isUnreadHighlight ? "is-unread-highlight" : ""
                     }`}
-                    onDoubleClick={() => startReply(message)}
-                    onTouchEnd={() => handleMessageActivate(message)}
+                    data-message-id={message.id}
                   >
+                    <div className="message-stack">
+                    {reactionPickerId === message.id ? (
+                      <div
+                        className={`reaction-picker ${
+                          isMine ? "is-mine" : "is-theirs"
+                        }`}
+                        onPointerDown={(event) => event.stopPropagation()}
+                      >
+                        {REACTION_EMOJIS.map((emoji) => (
+                          <button
+                            aria-label={`React with ${emoji}`}
+                            className="reaction-picker-button"
+                            key={emoji}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void toggleReaction(message.id, emoji);
+                              setReactionPickerId(null);
+                            }}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            type="button"
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+
+                    <div
+                      className={`message-bubble ${
+                        isEmojiOnly ? "message-emoji-only" : ""
+                      }`}
+                      onDoubleClick={() => startReply(message)}
+                      onPointerDown={() => handleBubblePointerDown(message)}
+                      onPointerLeave={handleBubblePointerUp}
+                      onPointerUp={handleBubblePointerUp}
+                      onTouchEnd={() => handleMessageActivate(message)}
+                    >
                     {!isMine && !isEmojiOnly ? (
                       <div className="sender-name">{message.sender_name}</div>
                     ) : null}
@@ -1356,16 +2025,46 @@ export default function ChatRoom() {
                           <div className="message-emoji-meta">{messageMeta}</div>
                         </div>
                       ) : (
-                        <p className="message-text">
-                          <span className="message-copy">{message.body}</span>
+                        <div className="message-text">
+                          <MessageBody text={message.body} />
                           {messageMeta}
-                        </p>
+                        </div>
                       )
                     ) : (
                       <div className="message-meta-line">{messageMeta}</div>
                     )}
-                  </div>
-                </article>
+                    </div>
+
+                    {reactionGroups.length ? (
+                      <div
+                        className={`message-reactions ${
+                          isMine ? "is-mine" : "is-theirs"
+                        }`}
+                      >
+                        {reactionGroups.map((group) => (
+                          <button
+                            className={`reaction-chip ${
+                              group.users.includes(senderId) ? "is-mine" : ""
+                            }`}
+                            key={group.emoji}
+                            onClick={() =>
+                              void toggleReaction(message.id, group.emoji)
+                            }
+                            type="button"
+                          >
+                            <span aria-hidden="true">{group.emoji}</span>
+                            {group.users.length > 1 ? (
+                              <span className="reaction-count">
+                                {group.users.length}
+                              </span>
+                            ) : null}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    </div>
+                  </article>
+                </Fragment>
               );
             })
           ) : (
@@ -1447,7 +2146,7 @@ export default function ChatRoom() {
           </button>
           <textarea
             aria-label="Message"
-            onChange={(event) => setText(event.target.value)}
+            onChange={(event) => handleTextChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape" && replyTo) {
                 event.preventDefault();
@@ -1463,12 +2162,11 @@ export default function ChatRoom() {
             placeholder={replyTo ? "Reply..." : "Write a message"}
             ref={textareaRef}
             rows={1}
-            value={text}
           />
           <button
             aria-label="Send message"
             className="send-button"
-            disabled={isSending || (!text.trim() && !selectedFile)}
+            disabled={isSending || (!hasDraftText && !selectedFile)}
             title="Send message"
             type="submit"
           >
