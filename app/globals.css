@@ -484,6 +484,10 @@ button:disabled {
   animation: reply-target-flash 0.9s ease;
 }
 
+.message-row.is-reply-highlight.is-single-emoji .message-emoji-large {
+  animation: reply-emoji-flash 0.9s ease;
+}
+
 @keyframes reply-target-flash {
   0%,
   100% {
@@ -494,6 +498,64 @@ button:disabled {
   42% {
     filter: brightness(0.88);
   }
+}
+
+@keyframes reply-emoji-flash {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  18%,
+  42% {
+    transform: scale(0.92);
+  }
+}
+
+.message-row.is-single-emoji .message-bubble.message-emoji-only {
+  background: transparent;
+  box-shadow: none;
+  max-width: none;
+  min-width: 0;
+  padding: 2px 4px;
+}
+
+.message-row.is-single-emoji .message-bubble.message-emoji-only::before {
+  content: none;
+}
+
+.message-emoji-only-content {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.message-row.is-theirs.is-single-emoji .message-emoji-only-content {
+  align-items: flex-start;
+}
+
+.message-emoji-large {
+  font-size: clamp(2.75rem, 10vw, 3.5rem);
+  line-height: 1;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.message-emoji-meta {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 0.75rem;
+  width: 100%;
+}
+
+.message-row.is-theirs.is-single-emoji .message-emoji-meta {
+  justify-content: flex-start;
+}
+
+.message-row.is-single-emoji .message-meta {
+  bottom: auto;
+  position: static;
 }
 
 .reply-quote {

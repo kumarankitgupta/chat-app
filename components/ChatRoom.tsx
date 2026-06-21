@@ -123,6 +123,51 @@ function getMessagePreview(message: Pick<Message, "body" | "media_type">) {
   return "Message";
 }
 
+function isSingleEmoji(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    const segments = [...segmenter.segment(trimmed)].map(
+      (part) => part.segment,
+    );
+
+    if (segments.length !== 1) {
+      return false;
+    }
+
+    return /\p{Extended_Pictographic}/u.test(segments[0]!);
+  }
+
+  const emojis = trimmed.match(/\p{Extended_Pictographic}/gu);
+  if (!emojis || emojis.length !== 1) {
+    return false;
+  }
+
+  const withoutEmojiParts = trimmed
+    .replace(/\p{Extended_Pictographic}|\p{Emoji_Modifier}|\uFE0F|\u200D/gu, "")
+    .trim();
+
+  return withoutEmojiParts.length === 0;
+}
+
+function isSingleEmojiMessage(
+  message: Pick<Message, "body" | "media_url" | "media_type" | "reply_to_id">,
+) {
+  if (message.media_url || message.media_type || message.reply_to_id) {
+    return false;
+  }
+
+  if (!message.body?.trim()) {
+    return false;
+  }
+
+  return isSingleEmoji(message.body);
+}
+
 function toReplyTarget(message: Message): ReplyTarget {
   return {
     id: message.id,
@@ -1017,6 +1062,7 @@ export default function ChatRoom() {
           ) : messages.length ? (
             messages.map((message) => {
               const isMine = message.sender_id === senderId;
+              const isEmojiOnly = isSingleEmojiMessage(message);
               const messageMeta = (
                 <span className="message-meta">
                   <time dateTime={message.created_at}>
@@ -1049,17 +1095,21 @@ export default function ChatRoom() {
               return (
                 <article
                   className={`message-row ${isMine ? "is-mine" : "is-theirs"} ${
+                    isEmojiOnly ? "is-single-emoji" : ""
+                  } ${
                     highlightedMessageId === message.id ? "is-reply-highlight" : ""
                   }`}
                   data-message-id={message.id}
                   key={message.id}
                 >
                   <div
-                    className="message-bubble"
+                    className={`message-bubble ${
+                      isEmojiOnly ? "message-emoji-only" : ""
+                    }`}
                     onDoubleClick={() => startReply(message)}
                     onTouchEnd={() => handleMessageActivate(message)}
                   >
-                    {!isMine ? (
+                    {!isMine && !isEmojiOnly ? (
                       <div className="sender-name">{message.sender_name}</div>
                     ) : null}
 
@@ -1130,10 +1180,19 @@ export default function ChatRoom() {
                     ) : null}
 
                     {message.body ? (
-                      <p className="message-text">
-                        <span className="message-copy">{message.body}</span>
-                        {messageMeta}
-                      </p>
+                      isEmojiOnly ? (
+                        <div className="message-emoji-only-content">
+                          <span className="message-emoji-large">
+                            {message.body.trim()}
+                          </span>
+                          <div className="message-emoji-meta">{messageMeta}</div>
+                        </div>
+                      ) : (
+                        <p className="message-text">
+                          <span className="message-copy">{message.body}</span>
+                          {messageMeta}
+                        </p>
+                      )
                     ) : (
                       <div className="message-meta-line">{messageMeta}</div>
                     )}
