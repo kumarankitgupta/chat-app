@@ -181,8 +181,156 @@ function isUploadableMedia(file: File) {
   return file.type.startsWith("image/") || file.type.startsWith("video/");
 }
 
-const MESSAGE_SELECT =
-  "id, body, media_url, media_path, media_type, sender_id, sender_name, created_at, read_at, reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type";
+const MESSAGE_PAGE_SIZE = 100;
+const MAX_MESSAGES_LOAD = 500;
+
+const MESSAGE_SELECT_BASE =
+  "id, body, media_url, media_path, media_type, sender_id, sender_name, created_at, read_at";
+
+const MESSAGE_SELECT_WITH_REPLY = `${MESSAGE_SELECT_BASE}, reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type`;
+
+let replyColumnsSupported: boolean | null = null;
+
+function normalizeMessage(raw: Partial<Message> & Pick<Message, "id" | "created_at" | "sender_id" | "sender_name">): Message {
+  return {
+    id: raw.id,
+    body: raw.body ?? null,
+    media_url: raw.media_url ?? null,
+    media_path: raw.media_path ?? null,
+    media_type: raw.media_type ?? null,
+    sender_id: raw.sender_id,
+    sender_name: raw.sender_name,
+    created_at: raw.created_at,
+    read_at: raw.read_at ?? null,
+    reply_to_id: raw.reply_to_id ?? null,
+    reply_to_sender_name: raw.reply_to_sender_name ?? null,
+    reply_to_body: raw.reply_to_body ?? null,
+    reply_to_media_type: raw.reply_to_media_type ?? null,
+  };
+}
+
+function mergeMessagesById(...groups: Message[][]): Message[] {
+  const byId = new Map<string, Message>();
+
+  for (const group of groups) {
+    for (const message of group) {
+      byId.set(message.id, message);
+    }
+  }
+
+  return sortMessages([...byId.values()]);
+}
+
+function isMissingReplyColumnError(error: { message?: string; code?: string }) {
+  return (
+    error.code === "42703" ||
+    error.message?.includes("reply_to_id") ||
+    error.message?.includes("reply_to_body") ||
+    error.message?.includes("reply_to_sender_name") ||
+    error.message?.includes("reply_to_media_type")
+  );
+}
+
+async function queryMessages(options?: {
+  before?: string;
+  limit?: number;
+  count?: boolean;
+}) {
+  const limit = options?.limit ?? MESSAGE_PAGE_SIZE;
+  const selectOptions = options?.count ? { count: "exact" as const } : undefined;
+
+  const buildQuery = (select: string) => {
+    let query = supabase
+      .from("messages")
+      .select(select, selectOptions)
+      .in("sender_id", [...CHAT_USERS])
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (options?.before) {
+      query = query.lt("created_at", options.before);
+    }
+
+    return query;
+  };
+
+  if (replyColumnsSupported !== false) {
+    const withReply = await buildQuery(MESSAGE_SELECT_WITH_REPLY);
+
+    if (!withReply.error) {
+      replyColumnsSupported = true;
+      return {
+        ...withReply,
+        data: (withReply.data ?? []).map((row) =>
+          normalizeMessage(row as unknown as Message),
+        ),
+      };
+    }
+
+    if (isMissingReplyColumnError(withReply.error)) {
+      replyColumnsSupported = false;
+    } else {
+      return { ...withReply, data: null };
+    }
+  }
+
+  const base = await buildQuery(MESSAGE_SELECT_BASE);
+
+  return {
+    ...base,
+    data: base.data
+      ? base.data.map((row) => normalizeMessage(row as unknown as Message))
+      : null,
+  };
+}
+
+async function loadAllMessages() {
+  const { data: firstPage, error, count } = await queryMessages({
+    limit: MESSAGE_PAGE_SIZE,
+    count: true,
+  });
+
+  if (error) {
+    return { messages: [] as Message[], count: 0, error };
+  }
+
+  let loaded = firstPage ?? [];
+
+  while (
+    loaded.length < MAX_MESSAGES_LOAD &&
+    loaded.length < (count ?? 0) &&
+    loaded.length > 0
+  ) {
+    const oldestLoaded = loaded.reduce((oldest, message) =>
+      new Date(message.created_at).getTime() <
+      new Date(oldest.created_at).getTime()
+        ? message
+        : oldest,
+    );
+
+    const { data: olderPage, error: olderError } = await queryMessages({
+      before: oldestLoaded.created_at,
+      limit: MESSAGE_PAGE_SIZE,
+    });
+
+    if (olderError || !olderPage?.length) {
+      break;
+    }
+
+    const previousCount = loaded.length;
+    loaded = mergeMessagesById(loaded, olderPage);
+
+    if (loaded.length === previousCount || olderPage.length < MESSAGE_PAGE_SIZE) {
+      break;
+    }
+  }
+
+  return {
+    messages: sortMessages(loaded),
+    count: count ?? loaded.length,
+    error: null,
+  };
+}
 
 const SCROLL_BOTTOM_THRESHOLD = 80;
 
@@ -301,42 +449,53 @@ export default function ChatRoom() {
     [latestOtherPresence],
   );
 
-  const fetchMessages = useCallback(async () => {
-    const { data, error, count } = await supabase
-      .from("messages")
-      .select(MESSAGE_SELECT, { count: "exact" })
-      .in("sender_id", [...CHAT_USERS])
-      .order("created_at", { ascending: false })
-      .limit(50);
+  const fetchMessages = useCallback(async (options?: { fullHistory?: boolean }) => {
+    if (options?.fullHistory) {
+      const { messages: loaded, count, error } = await loadAllMessages();
 
-    if (error) {
+      if (error) {
+        setNotice(
+          "Could not load messages. Check your Supabase connection and try refreshing.",
+        );
+        return;
+      }
+
+      setMessages(loaded);
+      setHasMoreMessages(count > loaded.length);
       setNotice(
-        "Supabase is not ready yet. Run the SQL in supabase-setup.sql, then refresh.",
+        replyColumnsSupported === false
+          ? "Reply feature needs supabase-reply-migration.sql. Other messages still work."
+          : "",
       );
       return;
     }
 
-    const fetched = sortMessages((data ?? []) as Message[]);
+    const { data, error, count } = await queryMessages({
+      limit: MESSAGE_PAGE_SIZE,
+      count: true,
+    });
+
+    if (error) {
+      setNotice(
+        "Could not load messages. Check your Supabase connection and try refreshing.",
+      );
+      return;
+    }
+
+    const fetched = data ?? [];
 
     setMessages((current) => {
-      if (!current.length) {
-        return fetched;
-      }
-
-      const fetchedById = new Map(
-        fetched.map((message) => [message.id, message]),
-      );
-      const currentIds = new Set(current.map((message) => message.id));
-      const updatedCurrent = current.map(
-        (message) => fetchedById.get(message.id) ?? message,
-      );
-      const brandNew = fetched.filter((message) => !currentIds.has(message.id));
-      const merged = sortMessages([...updatedCurrent, ...brandNew]);
-
-      return messagesAreEqual(current, merged) ? current : merged;
+      const merged = current.length
+        ? mergeMessagesById(current, fetched)
+        : sortMessages(fetched);
+      setHasMoreMessages((count ?? 0) > merged.length);
+      return merged;
     });
-    setHasMoreMessages((count ?? 0) > 50);
-    setNotice("");
+    setNotice(
+      replyColumnsSupported === false
+        ? "Reply feature needs supabase-reply-migration.sql. Other messages still work."
+        : "",
+    );
   }, []);
 
   const fetchOlderMessages = useCallback(async () => {
@@ -348,13 +507,10 @@ export default function ChatRoom() {
     const oldestMessage = messages[0];
     const oldestTimestamp = oldestMessage.created_at;
 
-    const { data, error } = await supabase
-      .from("messages")
-      .select(MESSAGE_SELECT)
-      .in("sender_id", [...CHAT_USERS])
-      .lt("created_at", oldestTimestamp)
-      .order("created_at", { ascending: true })
-      .limit(50);
+    const { data, error } = await queryMessages({
+      before: oldestTimestamp,
+      limit: MESSAGE_PAGE_SIZE,
+    });
 
     if (error) {
       console.error("Error fetching older messages:", error);
@@ -375,10 +531,8 @@ export default function ChatRoom() {
       stickToBottomRef.current = false;
       isViewingHistoryRef.current = true;
 
-      setMessages((current) =>
-        sortMessages([...(data as Message[]), ...current])
-      );
-      setHasMoreMessages(data.length === 50);
+      setMessages((current) => mergeMessagesById(data, current));
+      setHasMoreMessages(data.length === MESSAGE_PAGE_SIZE);
     } else {
       setHasMoreMessages(false);
     }
@@ -468,7 +622,11 @@ export default function ChatRoom() {
       hasCompletedInitialScrollRef.current = false;
       stickToBottomRef.current = true;
       isViewingHistoryRef.current = false;
-      await Promise.all([fetchMessages(), fetchPresences(), updatePresence()]);
+      await Promise.all([
+        fetchMessages({ fullHistory: true }),
+        fetchPresences(),
+        updatePresence(),
+      ]);
       if (isMounted) {
         setIsLoading(false);
       }
@@ -483,23 +641,21 @@ export default function ChatRoom() {
         { event: "*", schema: "public", table: "messages" },
         (payload) => {
           if (payload.eventType === "INSERT") {
+            const inserted = normalizeMessage(payload.new as Message);
             setMessages((current) =>
-              sortMessages([
-                ...current.filter(
-                  (message) => message.id !== (payload.new as Message).id,
-                ),
-                payload.new as Message,
-              ]),
+              mergeMessagesById(
+                current.filter((message) => message.id !== inserted.id),
+                [inserted],
+              ),
             );
           }
 
           if (payload.eventType === "UPDATE") {
-            const updated = payload.new as Message;
+            const updated = normalizeMessage(payload.new as Message);
             setMessages((current) => {
-              const next = sortMessages(
-                current.map((message) =>
-                  message.id === updated.id ? updated : message,
-                ),
+              const next = mergeMessagesById(
+                current.filter((message) => message.id !== updated.id),
+                [updated],
               );
               return messagesAreEqual(current, next) ? current : next;
             });
@@ -728,13 +884,10 @@ export default function ChatRoom() {
     }
 
     const oldestTimestamp = current[0].created_at;
-    const { data, error } = await supabase
-      .from("messages")
-      .select(MESSAGE_SELECT)
-      .in("sender_id", [...CHAT_USERS])
-      .lt("created_at", oldestTimestamp)
-      .order("created_at", { ascending: true })
-      .limit(50);
+    const { data, error } = await queryMessages({
+      before: oldestTimestamp,
+      limit: MESSAGE_PAGE_SIZE,
+    });
 
     if (error) {
       console.error("Error fetching older messages:", error);
@@ -752,11 +905,11 @@ export default function ChatRoom() {
     stickToBottomRef.current = false;
     isViewingHistoryRef.current = true;
 
-    const merged = sortMessages([...(data as Message[]), ...current]);
+    const merged = mergeMessagesById(data, current);
     messagesRef.current = merged;
     setMessages(merged);
 
-    const hasMore = data.length === 50;
+    const hasMore = data.length === MESSAGE_PAGE_SIZE;
     setHasMoreMessages(hasMore);
     hasMoreMessagesRef.current = hasMore;
 
@@ -857,6 +1010,9 @@ export default function ChatRoom() {
     window.sessionStorage.setItem(CHAT_USER_STORAGE_KEY, user);
     window.localStorage.removeItem("private-chat-sender-id");
     window.localStorage.removeItem("private-chat-sender-name");
+    setMessages([]);
+    setHasMoreMessages(false);
+    setReplyTo(null);
     setSenderId(user);
     setSenderName(user);
   }
@@ -933,7 +1089,7 @@ export default function ChatRoom() {
         media = await uploadSelectedFile(selectedFile);
       }
 
-      const { error } = await supabase.from("messages").insert({
+      const payload = {
         body: body || null,
         media_url: media?.mediaUrl ?? null,
         media_path: media?.mediaPath ?? null,
@@ -944,7 +1100,19 @@ export default function ChatRoom() {
         reply_to_sender_name: replyTo?.sender_name ?? null,
         reply_to_body: replyTo ? getMessagePreview(replyTo) : null,
         reply_to_media_type: replyTo?.media_type ?? null,
-      });
+      };
+
+      let { error } = await supabase.from("messages").insert(payload);
+
+      if (error && isMissingReplyColumnError(error)) {
+        replyColumnsSupported = false;
+        const { reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type, ...basePayload } = payload;
+        void reply_to_id;
+        void reply_to_sender_name;
+        void reply_to_body;
+        void reply_to_media_type;
+        ({ error } = await supabase.from("messages").insert(basePayload));
+      }
 
       if (error) {
         throw error;
