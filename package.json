@@ -14,8 +14,7 @@
     "lucide-react": "latest",
     "next": "latest",
     "react": "latest",
-    "react-dom": "latest",
-    "web-push": "^3.6.7"
+    "react-dom": "latest"
   },
   "overrides": {
     "postcss": "^8.5.10"
@@ -24,7 +23,6 @@
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "@types/web-push": "^3.6.4",
     "typescript": "latest"
   }
 }

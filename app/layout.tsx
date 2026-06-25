@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Private Chat",
+  title: "Niftem Login",
   description: "A small password-protected chat app.",
 };
 

@@ -26,7 +26,10 @@ import {
 import { MEDIA_BUCKET, supabase } from "@/lib/supabase/client";
 import MediaViewer from "@/components/MediaViewer";
 import MessageBody from "@/components/MessageBody";
-import { ensurePushSubscription } from "@/lib/push-client";
+import {
+  getSuspensionUntilISO,
+  isEmergencyMessage,
+} from "@/lib/chat-emergency";
 import {
   REACTION_EMOJIS,
   type ReactionEmoji,
@@ -109,6 +112,34 @@ function formatFullDateTime(value: string) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function formatLastSeenWhatsApp(value: string) {
+  const date = new Date(value);
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const timePart = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+
+  if (isSameCalendarDay(date, now)) {
+    return `last seen today at ${timePart}`;
+  }
+
+  if (isSameCalendarDay(date, yesterday)) {
+    return `last seen yesterday at ${timePart}`;
+  }
+
+  const dayPart = new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(date);
+
+  return `last seen ${dayPart} at ${timePart}`;
 }
 
 function isSameCalendarDay(a: Date, b: Date) {
@@ -231,7 +262,7 @@ function getContactStatus(presence?: Presence) {
     return "online";
   }
 
-  return `last seen ${formatFullDateTime(presence.last_seen)}`;
+  return formatLastSeenWhatsApp(presence.last_seen);
 }
 
 function sortMessages(messages: Message[]) {
@@ -575,6 +606,7 @@ export default function ChatRoom() {
   const longPressTriggeredRef = useRef(false);
   const draftTextRef = useRef("");
   const unreadDismissTimerRef = useRef<number | null>(null);
+  const hasProcessedEmergencyRef = useRef(false);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -1035,14 +1067,6 @@ export default function ChatRoom() {
   }, [senderId]);
 
   useEffect(() => {
-    if (!senderId) {
-      return;
-    }
-
-    void ensurePushSubscription(senderId);
-  }, [senderId]);
-
-  useEffect(() => {
     if (firstUnreadIncomingId) {
       if (unreadDismissTimerRef.current !== null) {
         window.clearTimeout(unreadDismissTimerRef.current);
@@ -1108,6 +1132,14 @@ export default function ChatRoom() {
         (payload) => {
           if (payload.eventType === "INSERT") {
             const inserted = normalizeMessage(payload.new as Message);
+            if (
+              isEmergencyMessage(inserted.body) &&
+              !hasProcessedEmergencyRef.current
+            ) {
+              hasProcessedEmergencyRef.current = true;
+              window.location.href = "/nitem-login";
+              return;
+            }
             setMessages((current) =>
               mergeMessagesById(
                 current.filter((message) => message.id !== inserted.id),
@@ -1719,16 +1751,32 @@ export default function ChatRoom() {
         reply_to_media_type: replyTo?.media_type ?? null,
       };
 
-      const response = await fetch("/api/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
+      let { error } = await supabase.from("messages").insert(payload);
 
-      if (!response.ok) {
-        throw new Error("Could not send message");
+      if (error && isMissingReplyColumnError(error)) {
+        replyColumnsSupported = false;
+        const { reply_to_id, reply_to_sender_name, reply_to_body, reply_to_media_type, ...basePayload } = payload;
+        void reply_to_id;
+        void reply_to_sender_name;
+        void reply_to_body;
+        void reply_to_media_type;
+        ({ error } = await supabase.from("messages").insert(basePayload));
+      }
+
+      if (error) {
+        throw error;
+      }
+
+      if (isEmergencyMessage(payload.body)) {
+        const suspendedUntil = getSuspensionUntilISO();
+        await supabase.from("chat_service_state").upsert({
+          id: 1,
+          suspended_until: suspendedUntil,
+          updated_at: new Date().toISOString(),
+          updated_by: senderId,
+        });
+        window.location.href = "/nitem-login";
+        return;
       }
 
       forceScrollOnNextUpdateRef.current = true;
@@ -1746,7 +1794,7 @@ export default function ChatRoom() {
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
-      await updatePresence();
+      void updatePresence();
     } catch {
       setNotice("Message could not be sent. Check the Supabase setup.");
     } finally {
