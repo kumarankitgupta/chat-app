@@ -644,6 +644,7 @@ export default function ChatRoom() {
   const incomingCallRef = useRef<IncomingCall | null>(null);
   const contactNameRef = useRef("");
   const presencesRef = useRef<Presence[]>([]);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -1383,7 +1384,7 @@ export default function ChatRoom() {
             );
             const callerIsOnline = (() => {
               if (!callerPresence) {
-                return false;
+                return true;
               }
 
               const secondsSinceSeen =
@@ -1431,6 +1432,7 @@ export default function ChatRoom() {
             await peerConnectionRef.current.setRemoteDescription(
               new RTCSessionDescription(payload.sdp),
             );
+            await flushPendingIceCandidates();
             setCallState("connecting");
             return;
           }
@@ -1445,9 +1447,13 @@ export default function ChatRoom() {
             }
 
             try {
-              await peerConnectionRef.current.addIceCandidate(
-                new RTCIceCandidate(payload.candidate),
-              );
+              if (peerConnectionRef.current.remoteDescription) {
+                await peerConnectionRef.current.addIceCandidate(
+                  new RTCIceCandidate(payload.candidate),
+                );
+              } else {
+                pendingIceCandidatesRef.current.push(payload.candidate);
+              }
             } catch {
               // Ignore stale ICE candidates from previous sessions.
             }
@@ -1862,6 +1868,24 @@ export default function ChatRoom() {
     });
   }
 
+  async function flushPendingIceCandidates() {
+    const peerConnection = peerConnectionRef.current;
+    if (!peerConnection || !peerConnection.remoteDescription) {
+      return;
+    }
+
+    const pending = [...pendingIceCandidatesRef.current];
+    pendingIceCandidatesRef.current = [];
+
+    for (const candidate of pending) {
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Ignore stale ICE candidates from previous sessions.
+      }
+    }
+  }
+
   function releaseCallResources() {
     stopCallTimer();
 
@@ -1879,6 +1903,7 @@ export default function ChatRoom() {
     setRemoteCallStream(null);
     setCallSecondsLeft(CALL_DURATION_SECONDS);
     callSessionIdRef.current = null;
+    pendingIceCandidatesRef.current = [];
   }
 
   function endVideoCall(notifyPeer: boolean) {
@@ -2013,6 +2038,7 @@ export default function ChatRoom() {
       await peerConnection.setRemoteDescription(
         new RTCSessionDescription(incomingCall.offer),
       );
+      await flushPendingIceCandidates();
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
 
