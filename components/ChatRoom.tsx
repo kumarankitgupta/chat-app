@@ -107,6 +107,19 @@ function getPeerId(user: ChatUser) {
   return `private-chat-${user}`;
 }
 
+function getPeerErrorMessage(type: string) {
+  if (type === "unavailable-id") {
+    return "Call service busy: close extra tab for this user and try again.";
+  }
+  if (type === "peer-unavailable") {
+    return "Other user call service is not ready yet. Try again.";
+  }
+  if (type === "network" || type === "socket-error" || type === "socket-closed") {
+    return "Call service connection lost. Reconnecting...";
+  }
+  return "Video call service is not available right now. Try again.";
+}
+
 function getStoredUser() {
   const storedUser = window.sessionStorage.getItem(CHAT_USER_STORAGE_KEY);
   return isChatUser(storedUser) ? storedUser : null;
@@ -595,6 +608,10 @@ export default function ChatRoom() {
   const [callSecondsLeft, setCallSecondsLeft] = useState(CALL_DURATION_SECONDS);
   const [localCallStream, setLocalCallStream] = useState<MediaStream | null>(null);
   const [remoteCallStream, setRemoteCallStream] = useState<MediaStream | null>(null);
+  const [isPeerReady, setIsPeerReady] = useState(false);
+  const [callServiceMessage, setCallServiceMessage] = useState(
+    "Connecting call service...",
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -666,6 +683,17 @@ export default function ChatRoom() {
       (Date.now() - new Date(latestOtherPresence.last_seen).getTime()) / 1000;
     return secondsSinceSeen < ONLINE_WINDOW_SECONDS;
   }, [latestOtherPresence, statusTick]);
+  const canStartCall =
+    callState === "idle" && isChatUser(contactName) && isContactOnline && isPeerReady;
+  const callButtonTitle = !isPeerReady
+    ? "Call service connecting..."
+    : !isContactOnline
+      ? "Both users must be online"
+      : "30 second video call";
+  const callProgressPercent =
+    (Math.max(0, Math.min(CALL_DURATION_SECONDS, callSecondsLeft)) /
+      CALL_DURATION_SECONDS) *
+    100;
 
   const messageTimeline = useMemo(
     () => buildMessageTimeline(messages),
@@ -1346,8 +1374,17 @@ export default function ChatRoom() {
       return;
     }
 
+    let shouldReconnect = true;
+
     const peer = new Peer(getPeerId(senderId));
     peerRef.current = peer;
+    setIsPeerReady(false);
+    setCallServiceMessage("Connecting call service...");
+
+    peer.on("open", () => {
+      setIsPeerReady(true);
+      setCallServiceMessage("Call service ready");
+    });
 
     peer.on("call", (call) => {
       const metaFrom = (call.metadata as { from?: string } | undefined)?.from;
@@ -1368,16 +1405,38 @@ export default function ChatRoom() {
       setCallState("incoming");
     });
 
-    peer.on("error", () => {
-      setNotice("Video call service is not available right now. Try again.");
+    peer.on("disconnected", () => {
+      setIsPeerReady(false);
+      setCallServiceMessage("Reconnecting call service...");
+      if (!peer.destroyed) {
+        peer.reconnect();
+      }
+    });
+
+    peer.on("error", (error) => {
+      const message = getPeerErrorMessage(error.type);
+      setIsPeerReady(false);
+      setCallServiceMessage(message);
+      setNotice(message);
       endVideoCall(false);
+
+      if (error.type === "disconnected" || error.type === "network") {
+        peer.reconnect();
+      }
+    });
+
+    peer.on("close", () => {
+      setIsPeerReady(false);
+      setCallServiceMessage("Call service disconnected.");
     });
 
     return () => {
+      shouldReconnect = false;
       if (peerRef.current === peer) {
         peerRef.current = null;
       }
       peer.destroy();
+      setIsPeerReady(false);
     };
   }, [senderId]);
 
@@ -1806,6 +1865,11 @@ export default function ChatRoom() {
       return;
     }
 
+    if (!isPeerReady || !peerRef.current) {
+      setNotice(callServiceMessage);
+      return;
+    }
+
     if (!isContactOnline) {
       setNotice("Video call is possible only when both users are online.");
       return;
@@ -1821,9 +1885,7 @@ export default function ChatRoom() {
       setIncomingCall(null);
       setCallState("calling");
       const peer = peerRef.current;
-      if (!peer) {
-        throw new Error("peer-not-ready");
-      }
+      if (!peer) throw new Error("peer-not-ready");
 
       const call = peer.call(getPeerId(contactName), stream, {
         metadata: { from: senderId },
@@ -2124,14 +2186,18 @@ export default function ChatRoom() {
           </div>
           <div className="header-actions">
             <span className="self-chip">as {senderName}</span>
+            <span
+              className={`call-status-chip ${isPeerReady ? "is-ready" : "is-loading"}`}
+              title={callServiceMessage}
+            >
+              {isPeerReady ? "call ready" : "call connecting"}
+            </span>
             <button
               aria-label="Start 30 second video call"
               className="icon-button header-call"
-              disabled={
-                callState !== "idle" || !isChatUser(contactName) || !isContactOnline
-              }
+              disabled={!canStartCall}
               onClick={() => void startVideoCall()}
-              title="30 second video call"
+              title={callButtonTitle}
               type="button"
             >
               <Video size={18} />
@@ -2156,7 +2222,7 @@ export default function ChatRoom() {
               <h2>Video call</h2>
               {callState === "incoming" && incomingCall ? (
                 <>
-                  <p>{incomingCall.from} wants to start a 30 second live video.</p>
+                  <p>{incomingCall.from} wants to start a 30-second live video.</p>
                   <p className="call-subtext">Audio is disabled for this call.</p>
                   <div className="call-actions">
                     <button
@@ -2177,13 +2243,21 @@ export default function ChatRoom() {
                 </>
               ) : (
                 <>
-                  <p>
+                  <p className="call-state-label">
                     {callState === "calling"
-                      ? "Calling..."
+                      ? "Calling user..."
                       : callState === "connecting"
-                        ? "Connecting..."
-                        : `Time left: ${callSecondsLeft}s`}
+                        ? "Connecting video..."
+                        : "Live video connected"}
                   </p>
+                  {callState === "active" ? (
+                    <div className="call-timer">
+                      <span>{callSecondsLeft}s left</span>
+                      <div className="call-progress">
+                        <span style={{ width: `${callProgressPercent}%` }} />
+                      </div>
+                    </div>
+                  ) : null}
                   <p className="call-subtext">Video only mode (audio off).</p>
                   <div className="call-videos">
                     <video
