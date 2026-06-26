@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import {
   Check,
   CheckCheck,
@@ -78,6 +79,23 @@ type TimelineItem =
   | { type: "date"; key: string; label: string }
   | { type: "message"; message: Message };
 
+type CallSignalType = "offer" | "answer" | "candidate" | "end" | "decline";
+
+type CallSignalPayload = {
+  type: CallSignalType;
+  sessionId: string;
+  from: ChatUser;
+  to: ChatUser;
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+};
+
+type IncomingCall = {
+  sessionId: string;
+  from: ChatUser;
+  offer: RTCSessionDescriptionInit;
+};
+
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const CHAT_USERS = ["bubu", "buggu"] as const;
 const CHAT_USER_STORAGE_KEY = "private-chat-user";
@@ -88,6 +106,8 @@ const TYPING_CLEAR_MS = 2000;
 const TYPING_PING_MS = 2500;
 const LONG_PRESS_MS = 500;
 const UNREAD_DISMISS_MS = 2200;
+const CALL_DURATION_SECONDS = 30;
+const ONLINE_WINDOW_SECONDS = 45;
 
 type ChatUser = (typeof CHAT_USERS)[number];
 
@@ -258,7 +278,7 @@ function getContactStatus(presence?: Presence) {
   const secondsSinceSeen =
     (Date.now() - new Date(presence.last_seen).getTime()) / 1000;
 
-  if (secondsSinceSeen < 45) {
+  if (secondsSinceSeen < ONLINE_WINDOW_SECONDS) {
     return "online";
   }
 
@@ -576,6 +596,13 @@ export default function ChatRoom() {
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
     null,
   );
+  const [callState, setCallState] = useState<
+    "idle" | "incoming" | "calling" | "connecting" | "active"
+  >("idle");
+  const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
+  const [callSecondsLeft, setCallSecondsLeft] = useState(CALL_DURATION_SECONDS);
+  const [localCallStream, setLocalCallStream] = useState<MediaStream | null>(null);
+  const [remoteCallStream, setRemoteCallStream] = useState<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -607,6 +634,16 @@ export default function ChatRoom() {
   const draftTextRef = useRef("");
   const unreadDismissTimerRef = useRef<number | null>(null);
   const hasProcessedEmergencyRef = useRef(false);
+  const callChannelRef = useRef<RealtimeChannel | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const callSessionIdRef = useRef<string | null>(null);
+  const callTimerRef = useRef<number | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const callStateRef = useRef(callState);
+  const incomingCallRef = useRef<IncomingCall | null>(null);
+  const contactNameRef = useRef("");
+  const presencesRef = useRef<Presence[]>([]);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -629,6 +666,15 @@ export default function ChatRoom() {
     () => getContactStatus(latestOtherPresence),
     [latestOtherPresence, statusTick],
   );
+  const isContactOnline = useMemo(() => {
+    if (!latestOtherPresence) {
+      return false;
+    }
+
+    const secondsSinceSeen =
+      (Date.now() - new Date(latestOtherPresence.last_seen).getTime()) / 1000;
+    return secondsSinceSeen < ONLINE_WINDOW_SECONDS;
+  }, [latestOtherPresence, statusTick]);
 
   const messageTimeline = useMemo(
     () => buildMessageTimeline(messages),
@@ -1067,6 +1113,22 @@ export default function ChatRoom() {
   }, [senderId]);
 
   useEffect(() => {
+    presencesRef.current = presences;
+  }, [presences]);
+
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
+
+  useEffect(() => {
+    incomingCallRef.current = incomingCall;
+  }, [incomingCall]);
+
+  useEffect(() => {
+    contactNameRef.current = contactName;
+  }, [contactName]);
+
+  useEffect(() => {
     if (firstUnreadIncomingId) {
       if (unreadDismissTimerRef.current !== null) {
         window.clearTimeout(unreadDismissTimerRef.current);
@@ -1301,8 +1363,158 @@ export default function ChatRoom() {
   }, [reactionPickerId]);
 
   useEffect(() => {
+    if (!senderId) {
+      return;
+    }
+
+    const channel = supabase
+      .channel("private-chat-calls")
+      .on(
+        "broadcast",
+        { event: "call-signal" },
+        async ({ payload }: { payload: CallSignalPayload }) => {
+          if (!payload || payload.to !== senderIdRef.current) {
+            return;
+          }
+
+          if (payload.type === "offer") {
+            const callerPresence = presencesRef.current.find(
+              (presence) => presence.session_id === payload.from,
+            );
+            const callerIsOnline = (() => {
+              if (!callerPresence) {
+                return false;
+              }
+
+              const secondsSinceSeen =
+                (Date.now() - new Date(callerPresence.last_seen).getTime()) / 1000;
+              return secondsSinceSeen < ONLINE_WINDOW_SECONDS;
+            })();
+
+            if (
+              callStateRef.current !== "idle" ||
+              !payload.sdp ||
+              !isChatUser(payload.from) ||
+              !callerIsOnline
+            ) {
+              const currentUser = senderIdRef.current;
+              if (!currentUser) {
+                return;
+              }
+              sendCallSignal({
+                type: "decline",
+                sessionId: payload.sessionId,
+                from: currentUser,
+                to: payload.from,
+              });
+              return;
+            }
+
+            setIncomingCall({
+              sessionId: payload.sessionId,
+              from: payload.from,
+              offer: payload.sdp,
+            });
+            setCallState("incoming");
+            return;
+          }
+
+          if (payload.type === "answer") {
+            if (
+              payload.sessionId !== callSessionIdRef.current ||
+              !payload.sdp ||
+              !peerConnectionRef.current
+            ) {
+              return;
+            }
+
+            await peerConnectionRef.current.setRemoteDescription(
+              new RTCSessionDescription(payload.sdp),
+            );
+            setCallState("connecting");
+            return;
+          }
+
+          if (payload.type === "candidate") {
+            if (
+              payload.sessionId !== callSessionIdRef.current ||
+              !payload.candidate ||
+              !peerConnectionRef.current
+            ) {
+              return;
+            }
+
+            try {
+              await peerConnectionRef.current.addIceCandidate(
+                new RTCIceCandidate(payload.candidate),
+              );
+            } catch {
+              // Ignore stale ICE candidates from previous sessions.
+            }
+            return;
+          }
+
+          if (payload.type === "decline") {
+            if (payload.sessionId !== callSessionIdRef.current) {
+              return;
+            }
+            setNotice("Video call was declined.");
+            endVideoCall(false);
+            return;
+          }
+
+          if (payload.type === "end") {
+            if (
+              payload.sessionId !== callSessionIdRef.current &&
+              payload.sessionId !== incomingCallRef.current?.sessionId
+            ) {
+              return;
+            }
+            setNotice("Video call ended.");
+            endVideoCall(false);
+          }
+        },
+      )
+      .subscribe();
+
+    callChannelRef.current = channel;
+
+    return () => {
+      if (callChannelRef.current === channel) {
+        callChannelRef.current = null;
+      }
+      void supabase.removeChannel(channel);
+    };
+  }, [senderId]);
+
+  useEffect(() => {
     void fetchReactions();
   }, [fetchReactions, senderId]);
+
+  useEffect(() => {
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = localCallStream;
+    }
+  }, [localCallStream]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteCallStream;
+    }
+  }, [remoteCallStream]);
+
+  useEffect(() => {
+    if (callState !== "calling" && callState !== "connecting") {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setNotice("Video call timed out.");
+      endVideoCall(true);
+    }, CALL_DURATION_SECONDS * 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [callState]);
 
   useEffect(() => {
     return () => {
@@ -1318,9 +1530,17 @@ export default function ChatRoom() {
       if (unreadDismissTimerRef.current !== null) {
         window.clearTimeout(unreadDismissTimerRef.current);
       }
+      if (callTimerRef.current !== null) {
+        window.clearInterval(callTimerRef.current);
+      }
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+      }
+      localCallStream?.getTracks().forEach((track) => track.stop());
+      remoteCallStream?.getTracks().forEach((track) => track.stop());
       void clearTyping();
     };
-  }, [clearTyping]);
+  }, [clearTyping, localCallStream, remoteCallStream]);
 
   useEffect(() => {
     void markMessagesRead(messages);
@@ -1612,6 +1832,221 @@ export default function ChatRoom() {
     setReplyTo(null);
   }
 
+  function stopCallTimer() {
+    if (callTimerRef.current !== null) {
+      window.clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+  }
+
+  function startCallTimer() {
+    stopCallTimer();
+    setCallSecondsLeft(CALL_DURATION_SECONDS);
+    callTimerRef.current = window.setInterval(() => {
+      setCallSecondsLeft((current) => {
+        if (current <= 1) {
+          stopCallTimer();
+          void endVideoCall(true);
+          return 0;
+        }
+        return current - 1;
+      });
+    }, 1000);
+  }
+
+  function sendCallSignal(payload: CallSignalPayload) {
+    void callChannelRef.current?.send({
+      type: "broadcast",
+      event: "call-signal",
+      payload,
+    });
+  }
+
+  function releaseCallResources() {
+    stopCallTimer();
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.onicecandidate = null;
+      peerConnectionRef.current.ontrack = null;
+      peerConnectionRef.current.onconnectionstatechange = null;
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    localCallStream?.getTracks().forEach((track) => track.stop());
+    remoteCallStream?.getTracks().forEach((track) => track.stop());
+    setLocalCallStream(null);
+    setRemoteCallStream(null);
+    setCallSecondsLeft(CALL_DURATION_SECONDS);
+    callSessionIdRef.current = null;
+  }
+
+  function endVideoCall(notifyPeer: boolean) {
+    const sessionId = callSessionIdRef.current;
+    if (
+      notifyPeer &&
+      sessionId &&
+      senderId &&
+      contactName &&
+      isChatUser(contactName)
+    ) {
+      sendCallSignal({
+        type: "end",
+        sessionId,
+        from: senderId,
+        to: contactName,
+      });
+    }
+
+    releaseCallResources();
+    setIncomingCall(null);
+    setCallState("idle");
+  }
+
+  function createPeerConnection(sessionId: string, peerUser: ChatUser) {
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    peerConnection.onicecandidate = (event) => {
+      if (!event.candidate || !senderId) {
+        return;
+      }
+
+      sendCallSignal({
+        type: "candidate",
+        sessionId,
+        from: senderId,
+        to: peerUser,
+        candidate: event.candidate.toJSON(),
+      });
+    };
+
+    peerConnection.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (stream) {
+        setRemoteCallStream(stream);
+      }
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      const state = peerConnection.connectionState;
+      if (state === "connected") {
+        setCallState("active");
+        startCallTimer();
+      } else if (
+        state === "failed" ||
+        state === "disconnected" ||
+        state === "closed"
+      ) {
+        endVideoCall(true);
+      }
+    };
+
+    peerConnectionRef.current = peerConnection;
+    return peerConnection;
+  }
+
+  async function startVideoCall() {
+    if (!senderId || !contactName || !isChatUser(contactName) || callState !== "idle") {
+      return;
+    }
+
+    if (!isContactOnline) {
+      setNotice("Video call is possible only when both users are online.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+      setLocalCallStream(stream);
+      setRemoteCallStream(null);
+
+      const sessionId = crypto.randomUUID();
+      callSessionIdRef.current = sessionId;
+      setIncomingCall(null);
+      setCallState("calling");
+
+      const peerConnection = createPeerConnection(sessionId, contactName);
+      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      sendCallSignal({
+        type: "offer",
+        sessionId,
+        from: senderId,
+        to: contactName,
+        sdp: offer,
+      });
+    } catch {
+      releaseCallResources();
+      setCallState("idle");
+      setNotice("Could not start video call. Allow camera permission and try again.");
+    }
+  }
+
+  async function acceptIncomingCall() {
+    if (!senderId || !incomingCall || callState !== "incoming") {
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+      setLocalCallStream(stream);
+      setRemoteCallStream(null);
+      setCallState("connecting");
+
+      const peerConnection = createPeerConnection(
+        incomingCall.sessionId,
+        incomingCall.from,
+      );
+      callSessionIdRef.current = incomingCall.sessionId;
+      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+      await peerConnection.setRemoteDescription(
+        new RTCSessionDescription(incomingCall.offer),
+      );
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+
+      sendCallSignal({
+        type: "answer",
+        sessionId: incomingCall.sessionId,
+        from: senderId,
+        to: incomingCall.from,
+        sdp: answer,
+      });
+      setIncomingCall(null);
+    } catch {
+      setNotice("Could not accept call. Check camera permission and try again.");
+      endVideoCall(true);
+    }
+  }
+
+  function declineIncomingCall() {
+    if (!incomingCall || !senderId) {
+      setIncomingCall(null);
+      setCallState("idle");
+      return;
+    }
+
+    sendCallSignal({
+      type: "decline",
+      sessionId: incomingCall.sessionId,
+      from: senderId,
+      to: incomingCall.from,
+    });
+    setIncomingCall(null);
+    setCallState("idle");
+  }
+
   function handleBubblePointerDown(message: Message) {
     longPressTriggeredRef.current = false;
     longPressTimerRef.current = window.setTimeout(() => {
@@ -1864,6 +2299,18 @@ export default function ChatRoom() {
           <div className="header-actions">
             <span className="self-chip">as {senderName}</span>
             <button
+              aria-label="Start 30 second video call"
+              className="icon-button header-call"
+              disabled={
+                callState !== "idle" || !isChatUser(contactName) || !isContactOnline
+              }
+              onClick={() => void startVideoCall()}
+              title="30 second video call"
+              type="button"
+            >
+              <Video size={18} />
+            </button>
+            <button
               aria-label="Lock room"
               className="icon-button header-lock"
               onClick={handleLogout}
@@ -1876,6 +2323,72 @@ export default function ChatRoom() {
         </header>
 
         {notice ? <div className="notice-banner">{notice}</div> : null}
+
+        {callState !== "idle" ? (
+          <div className="call-overlay" role="dialog" aria-modal="true">
+            <div className="call-panel">
+              <h2>Video call</h2>
+              {callState === "incoming" && incomingCall ? (
+                <>
+                  <p>{incomingCall.from} wants to start a 30 second live video.</p>
+                  <p className="call-subtext">Audio is disabled for this call.</p>
+                  <div className="call-actions">
+                    <button
+                      className="primary-button"
+                      onClick={() => void acceptIncomingCall()}
+                      type="button"
+                    >
+                      Accept
+                    </button>
+                    <button
+                      className="ghost-button call-end-button"
+                      onClick={declineIncomingCall}
+                      type="button"
+                    >
+                      Decline
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p>
+                    {callState === "calling"
+                      ? "Calling..."
+                      : callState === "connecting"
+                        ? "Connecting..."
+                        : `Time left: ${callSecondsLeft}s`}
+                  </p>
+                  <p className="call-subtext">Video only mode (audio off).</p>
+                  <div className="call-videos">
+                    <video
+                      autoPlay
+                      className="call-video-large"
+                      muted
+                      playsInline
+                      ref={remoteVideoRef}
+                    />
+                    <video
+                      autoPlay
+                      className="call-video-small"
+                      muted
+                      playsInline
+                      ref={localVideoRef}
+                    />
+                  </div>
+                  <div className="call-actions">
+                    <button
+                      className="ghost-button call-end-button"
+                      onClick={() => endVideoCall(true)}
+                      type="button"
+                    >
+                      End call
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        ) : null}
 
         <div
           className="message-list"
