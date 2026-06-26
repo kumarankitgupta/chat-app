@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import Peer, { type MediaConnection } from "peerjs";
 import {
   Check,
   CheckCheck,
@@ -79,21 +79,9 @@ type TimelineItem =
   | { type: "date"; key: string; label: string }
   | { type: "message"; message: Message };
 
-type CallSignalType = "offer" | "answer" | "candidate" | "end" | "decline";
-
-type CallSignalPayload = {
-  type: CallSignalType;
-  sessionId: string;
-  from: ChatUser;
-  to: ChatUser;
-  sdp?: RTCSessionDescriptionInit;
-  candidate?: RTCIceCandidateInit;
-};
-
 type IncomingCall = {
-  sessionId: string;
   from: ChatUser;
-  offer: RTCSessionDescriptionInit;
+  call: MediaConnection;
 };
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
@@ -113,6 +101,10 @@ type ChatUser = (typeof CHAT_USERS)[number];
 
 function isChatUser(value: string | null): value is ChatUser {
   return CHAT_USERS.includes(value as ChatUser);
+}
+
+function getPeerId(user: ChatUser) {
+  return `private-chat-${user}`;
 }
 
 function getStoredUser() {
@@ -634,17 +626,15 @@ export default function ChatRoom() {
   const draftTextRef = useRef("");
   const unreadDismissTimerRef = useRef<number | null>(null);
   const hasProcessedEmergencyRef = useRef(false);
-  const callChannelRef = useRef<RealtimeChannel | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const callSessionIdRef = useRef<string | null>(null);
   const callTimerRef = useRef<number | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const callStateRef = useRef(callState);
-  const incomingCallRef = useRef<IncomingCall | null>(null);
-  const contactNameRef = useRef("");
-  const presencesRef = useRef<Presence[]>([]);
-  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const peerRef = useRef<Peer | null>(null);
+  const activeCallRef = useRef<MediaConnection | null>(null);
+  const isEndingCallRef = useRef(false);
+  const localCallStreamRef = useRef<MediaStream | null>(null);
+  const remoteCallStreamRef = useRef<MediaStream | null>(null);
 
   const latestOtherPresence = useMemo(() => {
     return presences
@@ -1114,20 +1104,8 @@ export default function ChatRoom() {
   }, [senderId]);
 
   useEffect(() => {
-    presencesRef.current = presences;
-  }, [presences]);
-
-  useEffect(() => {
     callStateRef.current = callState;
   }, [callState]);
-
-  useEffect(() => {
-    incomingCallRef.current = incomingCall;
-  }, [incomingCall]);
-
-  useEffect(() => {
-    contactNameRef.current = contactName;
-  }, [contactName]);
 
   useEffect(() => {
     if (firstUnreadIncomingId) {
@@ -1368,128 +1346,38 @@ export default function ChatRoom() {
       return;
     }
 
-    const channel = supabase
-      .channel("private-chat-calls")
-      .on(
-        "broadcast",
-        { event: "call-signal" },
-        async ({ payload }: { payload: CallSignalPayload }) => {
-          if (!payload || payload.to !== senderIdRef.current) {
-            return;
-          }
+    const peer = new Peer(getPeerId(senderId));
+    peerRef.current = peer;
 
-          if (payload.type === "offer") {
-            const callerPresence = presencesRef.current.find(
-              (presence) => presence.session_id === payload.from,
-            );
-            const callerIsOnline = (() => {
-              if (!callerPresence) {
-                return true;
-              }
+    peer.on("call", (call) => {
+      const metaFrom = (call.metadata as { from?: string } | undefined)?.from;
+      const peerFrom = call.peer.replace("private-chat-", "");
+      const from = (metaFrom ?? peerFrom).toLowerCase();
 
-              const secondsSinceSeen =
-                (Date.now() - new Date(callerPresence.last_seen).getTime()) / 1000;
-              return secondsSinceSeen < ONLINE_WINDOW_SECONDS;
-            })();
+      if (!isChatUser(from)) {
+        call.close();
+        return;
+      }
 
-            if (
-              callStateRef.current !== "idle" ||
-              !payload.sdp ||
-              !isChatUser(payload.from) ||
-              !callerIsOnline
-            ) {
-              const currentUser = senderIdRef.current;
-              if (!currentUser) {
-                return;
-              }
-              sendCallSignal({
-                type: "decline",
-                sessionId: payload.sessionId,
-                from: currentUser,
-                to: payload.from,
-              });
-              return;
-            }
+      if (callStateRef.current !== "idle") {
+        call.close();
+        return;
+      }
 
-            setIncomingCall({
-              sessionId: payload.sessionId,
-              from: payload.from,
-              offer: payload.sdp,
-            });
-            setCallState("incoming");
-            return;
-          }
+      setIncomingCall({ from, call });
+      setCallState("incoming");
+    });
 
-          if (payload.type === "answer") {
-            if (
-              payload.sessionId !== callSessionIdRef.current ||
-              !payload.sdp ||
-              !peerConnectionRef.current
-            ) {
-              return;
-            }
-
-            await peerConnectionRef.current.setRemoteDescription(
-              new RTCSessionDescription(payload.sdp),
-            );
-            await flushPendingIceCandidates();
-            setCallState("connecting");
-            return;
-          }
-
-          if (payload.type === "candidate") {
-            if (
-              payload.sessionId !== callSessionIdRef.current ||
-              !payload.candidate ||
-              !peerConnectionRef.current
-            ) {
-              return;
-            }
-
-            try {
-              if (peerConnectionRef.current.remoteDescription) {
-                await peerConnectionRef.current.addIceCandidate(
-                  new RTCIceCandidate(payload.candidate),
-                );
-              } else {
-                pendingIceCandidatesRef.current.push(payload.candidate);
-              }
-            } catch {
-              // Ignore stale ICE candidates from previous sessions.
-            }
-            return;
-          }
-
-          if (payload.type === "decline") {
-            if (payload.sessionId !== callSessionIdRef.current) {
-              return;
-            }
-            setNotice("Video call was declined.");
-            endVideoCall(false);
-            return;
-          }
-
-          if (payload.type === "end") {
-            if (
-              payload.sessionId !== callSessionIdRef.current &&
-              payload.sessionId !== incomingCallRef.current?.sessionId
-            ) {
-              return;
-            }
-            setNotice("Video call ended.");
-            endVideoCall(false);
-          }
-        },
-      )
-      .subscribe();
-
-    callChannelRef.current = channel;
+    peer.on("error", () => {
+      setNotice("Video call service is not available right now. Try again.");
+      endVideoCall(false);
+    });
 
     return () => {
-      if (callChannelRef.current === channel) {
-        callChannelRef.current = null;
+      if (peerRef.current === peer) {
+        peerRef.current = null;
       }
-      void supabase.removeChannel(channel);
+      peer.destroy();
     };
   }, [senderId]);
 
@@ -1501,12 +1389,14 @@ export default function ChatRoom() {
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = localCallStream;
     }
+    localCallStreamRef.current = localCallStream;
   }, [localCallStream]);
 
   useEffect(() => {
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = remoteCallStream;
     }
+    remoteCallStreamRef.current = remoteCallStream;
   }, [remoteCallStream]);
 
   useEffect(() => {
@@ -1539,14 +1429,12 @@ export default function ChatRoom() {
       if (callTimerRef.current !== null) {
         window.clearInterval(callTimerRef.current);
       }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
-      localCallStream?.getTracks().forEach((track) => track.stop());
-      remoteCallStream?.getTracks().forEach((track) => track.stop());
+      activeCallRef.current?.close();
+      localCallStreamRef.current?.getTracks().forEach((track) => track.stop());
+      remoteCallStreamRef.current?.getTracks().forEach((track) => track.stop());
       void clearTyping();
     };
-  }, [clearTyping, localCallStream, remoteCallStream]);
+  }, [clearTyping]);
 
   useEffect(() => {
     void markMessagesRead(messages);
@@ -1860,116 +1748,57 @@ export default function ChatRoom() {
     }, 1000);
   }
 
-  function sendCallSignal(payload: CallSignalPayload) {
-    void callChannelRef.current?.send({
-      type: "broadcast",
-      event: "call-signal",
-      payload,
+  function bindCallEvents(call: MediaConnection) {
+    activeCallRef.current = call;
+    call.on("stream", (stream) => {
+      setRemoteCallStream(stream);
+      setCallState("active");
+      startCallTimer();
     });
-  }
-
-  async function flushPendingIceCandidates() {
-    const peerConnection = peerConnectionRef.current;
-    if (!peerConnection || !peerConnection.remoteDescription) {
-      return;
-    }
-
-    const pending = [...pendingIceCandidatesRef.current];
-    pendingIceCandidatesRef.current = [];
-
-    for (const candidate of pending) {
-      try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch {
-        // Ignore stale ICE candidates from previous sessions.
+    call.on("close", () => {
+      if (!isEndingCallRef.current) {
+        setNotice("Video call ended.");
+        endVideoCall(false);
       }
-    }
+    });
+    call.on("error", () => {
+      if (!isEndingCallRef.current) {
+        setNotice("Video call failed. Please try again.");
+        endVideoCall(false);
+      }
+    });
   }
 
   function releaseCallResources() {
     stopCallTimer();
 
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.onicecandidate = null;
-      peerConnectionRef.current.ontrack = null;
-      peerConnectionRef.current.onconnectionstatechange = null;
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
+    if (activeCallRef.current) {
+      activeCallRef.current.close();
+      activeCallRef.current = null;
     }
 
     localCallStream?.getTracks().forEach((track) => track.stop());
     remoteCallStream?.getTracks().forEach((track) => track.stop());
+    localCallStreamRef.current?.getTracks().forEach((track) => track.stop());
+    remoteCallStreamRef.current?.getTracks().forEach((track) => track.stop());
     setLocalCallStream(null);
     setRemoteCallStream(null);
+    localCallStreamRef.current = null;
+    remoteCallStreamRef.current = null;
     setCallSecondsLeft(CALL_DURATION_SECONDS);
-    callSessionIdRef.current = null;
-    pendingIceCandidatesRef.current = [];
   }
 
-  function endVideoCall(notifyPeer: boolean) {
-    const sessionId = callSessionIdRef.current;
-    if (
-      notifyPeer &&
-      sessionId &&
-      senderId &&
-      contactName &&
-      isChatUser(contactName)
-    ) {
-      sendCallSignal({
-        type: "end",
-        sessionId,
-        from: senderId,
-        to: contactName,
-      });
+  function endVideoCall(_notifyPeer: boolean) {
+    if (isEndingCallRef.current) {
+      return;
     }
-
+    isEndingCallRef.current = true;
     releaseCallResources();
     setIncomingCall(null);
     setCallState("idle");
-  }
-
-  function createPeerConnection(sessionId: string, peerUser: ChatUser) {
-    const peerConnection = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-
-    peerConnection.onicecandidate = (event) => {
-      if (!event.candidate || !senderId) {
-        return;
-      }
-
-      sendCallSignal({
-        type: "candidate",
-        sessionId,
-        from: senderId,
-        to: peerUser,
-        candidate: event.candidate.toJSON(),
-      });
-    };
-
-    peerConnection.ontrack = (event) => {
-      const [stream] = event.streams;
-      if (stream) {
-        setRemoteCallStream(stream);
-      }
-    };
-
-    peerConnection.onconnectionstatechange = () => {
-      const state = peerConnection.connectionState;
-      if (state === "connected") {
-        setCallState("active");
-        startCallTimer();
-      } else if (
-        state === "failed" ||
-        state === "disconnected" ||
-        state === "closed"
-      ) {
-        endVideoCall(true);
-      }
-    };
-
-    peerConnectionRef.current = peerConnection;
-    return peerConnection;
+    window.setTimeout(() => {
+      isEndingCallRef.current = false;
+    }, 0);
   }
 
   async function startVideoCall() {
@@ -1989,25 +1818,21 @@ export default function ChatRoom() {
       });
       setLocalCallStream(stream);
       setRemoteCallStream(null);
-
-      const sessionId = crypto.randomUUID();
-      callSessionIdRef.current = sessionId;
       setIncomingCall(null);
       setCallState("calling");
+      const peer = peerRef.current;
+      if (!peer) {
+        throw new Error("peer-not-ready");
+      }
 
-      const peerConnection = createPeerConnection(sessionId, contactName);
-      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
-
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-
-      sendCallSignal({
-        type: "offer",
-        sessionId,
-        from: senderId,
-        to: contactName,
-        sdp: offer,
+      const call = peer.call(getPeerId(contactName), stream, {
+        metadata: { from: senderId },
       });
+      if (!call) {
+        throw new Error("call-init-failed");
+      }
+      bindCallEvents(call);
+      setCallState("connecting");
     } catch {
       releaseCallResources();
       setCallState("idle");
@@ -2028,27 +1853,8 @@ export default function ChatRoom() {
       setLocalCallStream(stream);
       setRemoteCallStream(null);
       setCallState("connecting");
-
-      const peerConnection = createPeerConnection(
-        incomingCall.sessionId,
-        incomingCall.from,
-      );
-      callSessionIdRef.current = incomingCall.sessionId;
-      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
-      await peerConnection.setRemoteDescription(
-        new RTCSessionDescription(incomingCall.offer),
-      );
-      await flushPendingIceCandidates();
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-
-      sendCallSignal({
-        type: "answer",
-        sessionId: incomingCall.sessionId,
-        from: senderId,
-        to: incomingCall.from,
-        sdp: answer,
-      });
+      bindCallEvents(incomingCall.call);
+      incomingCall.call.answer(stream);
       setIncomingCall(null);
     } catch {
       setNotice("Could not accept call. Check camera permission and try again.");
@@ -2057,18 +1863,12 @@ export default function ChatRoom() {
   }
 
   function declineIncomingCall() {
-    if (!incomingCall || !senderId) {
+    if (!incomingCall) {
       setIncomingCall(null);
       setCallState("idle");
       return;
     }
-
-    sendCallSignal({
-      type: "decline",
-      sessionId: incomingCall.sessionId,
-      from: senderId,
-      to: incomingCall.from,
-    });
+    incomingCall.call.close();
     setIncomingCall(null);
     setCallState("idle");
   }
