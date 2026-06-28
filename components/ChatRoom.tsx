@@ -2186,12 +2186,6 @@ export default function ChatRoom() {
           </div>
           <div className="header-actions">
             <span className="self-chip">as {senderName}</span>
-            <span
-              className={`call-status-chip ${isPeerReady ? "is-ready" : "is-loading"}`}
-              title={callServiceMessage}
-            >
-              {isPeerReady ? "call ready" : "call connecting"}
-            </span>
             <button
               aria-label="Start 30 second video call"
               className="icon-button header-call"
