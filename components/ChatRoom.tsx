@@ -27,6 +27,7 @@ import {
 import { MEDIA_BUCKET, supabase } from "@/lib/supabase/client";
 import MediaViewer from "@/components/MediaViewer";
 import MessageBody from "@/components/MessageBody";
+import LoveGalleryExperience from "@/components/LoveGalleryExperience";
 import {
   getSuspensionUntilISO,
   isEmergencyMessage,
@@ -118,6 +119,10 @@ function getPeerErrorMessage(type: string) {
     return "Call service connection lost. Reconnecting...";
   }
   return "Video call service is not available right now. Try again.";
+}
+
+function isChatTabActive() {
+  return document.visibilityState === "visible" && document.hasFocus();
 }
 
 function getStoredUser() {
@@ -612,6 +617,8 @@ export default function ChatRoom() {
   const [callServiceMessage, setCallServiceMessage] = useState(
     "Connecting call service...",
   );
+  const [showLoveExperience, setShowLoveExperience] = useState(false);
+  const [loveViewerKey, setLoveViewerKey] = useState("guest");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -887,6 +894,10 @@ export default function ChatRoom() {
         return;
       }
 
+      if (!isChatTabActive()) {
+        return;
+      }
+
       const payload: Record<string, string | boolean> = {
         session_id: senderId,
         display_name: senderName,
@@ -914,6 +925,36 @@ export default function ChatRoom() {
     },
     [senderId, senderName],
   );
+
+  const setAwayPresence = useCallback(async () => {
+    if (!senderId || !senderName) {
+      return;
+    }
+
+    const awayTimestamp = new Date(
+      Date.now() - (ONLINE_WINDOW_SECONDS + 10) * 1000,
+    ).toISOString();
+    const payload: Record<string, string | boolean> = {
+      session_id: senderId,
+      display_name: senderName,
+      last_seen: awayTimestamp,
+      is_typing: false,
+      typing_updated_at: new Date().toISOString(),
+    };
+
+    const withTyping = await supabase.from("chat_presence").upsert(payload);
+    if (
+      withTyping.error &&
+      (withTyping.error.code === "42703" ||
+        withTyping.error.message?.includes("is_typing"))
+    ) {
+      typingColumnsSupported = false;
+      const { is_typing, typing_updated_at, ...basePayload } = payload;
+      void is_typing;
+      void typing_updated_at;
+      await supabase.from("chat_presence").upsert(basePayload);
+    }
+  }, [senderId, senderName]);
 
   const clearTyping = useCallback(async () => {
     if (!senderId || typingColumnsSupported === false) {
@@ -1121,6 +1162,11 @@ export default function ChatRoom() {
       setSenderId(storedUser);
       setSenderName(storedUser);
     }
+
+    const initialViewerKey = storedUser ?? "guest";
+    setLoveViewerKey(initialViewerKey);
+    const seen = window.localStorage.getItem(`love-gallery-seen-${initialViewerKey}`);
+    setShowLoveExperience(seen !== "1");
   }, []);
 
   useEffect(() => {
@@ -1183,7 +1229,7 @@ export default function ChatRoom() {
       await Promise.all([
         fetchMessages({ fullHistory: true }),
         fetchPresences(),
-        updatePresence(),
+        isChatTabActive() ? updatePresence() : setAwayPresence(),
       ]);
       void fetchReactions();
       if (isMounted) {
@@ -1300,13 +1346,20 @@ export default function ChatRoom() {
     }, 7000);
 
     const presenceTimer = window.setInterval(() => {
-      void updatePresence();
+      if (isChatTabActive()) {
+        void updatePresence();
+      }
     }, 20000);
 
     const handleVisibility = () => {
-      void updatePresence();
-      void fetchMessages();
-      void markMessagesRead(messagesRef.current);
+      if (isChatTabActive()) {
+        void updatePresence();
+        void fetchMessages();
+        void markMessagesRead(messagesRef.current);
+      } else {
+        void clearTyping();
+        void setAwayPresence();
+      }
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
@@ -1328,6 +1381,8 @@ export default function ChatRoom() {
     fetchReactions,
     markMessagesRead,
     senderId,
+    setAwayPresence,
+    clearTyping,
     updatePresence,
   ]);
 
@@ -1978,6 +2033,11 @@ export default function ChatRoom() {
     window.sessionStorage.setItem(CHAT_USER_STORAGE_KEY, user);
     window.localStorage.removeItem("private-chat-sender-id");
     window.localStorage.removeItem("private-chat-sender-name");
+    setLoveViewerKey(user);
+    const seen = window.localStorage.getItem(`love-gallery-seen-${user}`);
+    if (seen !== "1") {
+      setShowLoveExperience(true);
+    }
     setMessages([]);
     setHasMoreMessages(false);
     setReplyTo(null);
@@ -2135,43 +2195,52 @@ export default function ChatRoom() {
 
   if (!senderId || !senderName) {
     return (
-      <main className="gate-screen">
-        <section className="gate-panel" aria-labelledby="identity-title">
-          <div className="gate-badge" aria-hidden="true">
-            <SmilePlus size={22} strokeWidth={2.2} />
-          </div>
-          <div className="gate-copy">
-            <p className="eyebrow">Private Room</p>
-            <h1 id="identity-title">Choose your name</h1>
-          </div>
-
-          <div className="user-choice">
-            <div className="choice-grid">
-              {CHAT_USERS.map((user) => (
-                <button
-                  className="choice-button"
-                  key={user}
-                  onClick={() => handleSelectUser(user)}
-                  type="button"
-                >
-                  {user}
-                </button>
-              ))}
+      <>
+        <main className="gate-screen">
+          <section className="gate-panel" aria-labelledby="identity-title">
+            <div className="gate-badge" aria-hidden="true">
+              <SmilePlus size={22} strokeWidth={2.2} />
             </div>
-          </div>
+            <div className="gate-copy">
+              <p className="eyebrow">Private Room</p>
+              <h1 id="identity-title">Choose your name</h1>
+            </div>
 
-          <button className="ghost-button lock-choice" onClick={handleLogout} type="button">
-            <LogOut size={17} aria-hidden="true" />
-            Lock room
-          </button>
-        </section>
-      </main>
+            <div className="user-choice">
+              <div className="choice-grid">
+                {CHAT_USERS.map((user) => (
+                  <button
+                    className="choice-button"
+                    key={user}
+                    onClick={() => handleSelectUser(user)}
+                    type="button"
+                  >
+                    {user}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <button className="ghost-button lock-choice" onClick={handleLogout} type="button">
+              <LogOut size={17} aria-hidden="true" />
+              Lock room
+            </button>
+          </section>
+        </main>
+        {showLoveExperience ? (
+          <LoveGalleryExperience
+            onFinish={() => setShowLoveExperience(false)}
+            viewerKey={loveViewerKey}
+          />
+        ) : null}
+      </>
     );
   }
 
   return (
-    <main className="chat-screen">
-      <section className="chat-panel" aria-label="Chat conversation">
+    <>
+      <main className="chat-screen">
+        <section className="chat-panel" aria-label="Chat conversation">
         <header className="chat-header">
           <div className="contact-summary">
             <div className="contact-avatar" aria-hidden="true">
@@ -2646,7 +2715,14 @@ export default function ChatRoom() {
             url={activeMedia.url}
           />
         ) : null}
-      </section>
-    </main>
+        </section>
+      </main>
+      {showLoveExperience ? (
+        <LoveGalleryExperience
+          onFinish={() => setShowLoveExperience(false)}
+          viewerKey={loveViewerKey}
+        />
+      ) : null}
+    </>
   );
 }
