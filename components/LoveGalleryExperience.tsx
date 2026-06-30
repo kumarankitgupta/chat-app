@@ -267,19 +267,21 @@ export default function LoveGalleryExperience({ viewerKey, onFinish }: Props) {
               <span key={confettiIndex} style={getConfettiStyle(confettiIndex)} />
             ))}
           </div>
-          {images.length ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              alt={`Love memory ${index + 1}`}
-              className="love-gallery-image"
-              key={images[index]}
-              src={images[index]}
-            />
-          ) : (
-            <div className="love-gallery-placeholder">
-              Preparing your memory wall...
-            </div>
-          )}
+          <div className="love-image-frame">
+            {images.length ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                alt={`Love memory ${index + 1}`}
+                className="love-gallery-image"
+                key={images[index]}
+                src={images[index]}
+              />
+            ) : (
+              <div className="love-gallery-placeholder">
+                Preparing your memory wall...
+              </div>
+            )}
+          </div>
           <p className="love-caption" key={`${index}-${currentMessage}`}>
             {currentMessage}
           </p>

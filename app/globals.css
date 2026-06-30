@@ -564,7 +564,7 @@ button:disabled {
   overflow: hidden;
   pointer-events: none;
   position: absolute;
-  z-index: 1;
+  z-index: 5;
 }
 
 .love-emoji-orbit span {
@@ -711,6 +711,7 @@ button:disabled {
   left: 14px;
   position: absolute;
   top: 14px;
+  z-index: 6;
 }
 
 .love-side-decor.left {
@@ -751,18 +752,56 @@ button:disabled {
   animation-name: side-bounce-right;
 }
 
+.love-image-frame {
+  align-items: center;
+  border-radius: 18px;
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  padding: 4px;
+  position: relative;
+  z-index: 2;
+}
+
+.love-image-frame::before {
+  animation: border-spin 3.2s linear infinite;
+  background: conic-gradient(
+    from 0deg,
+    rgba(255, 95, 170, 0.95),
+    rgba(255, 214, 102, 0.95),
+    rgba(124, 77, 255, 0.95),
+    rgba(77, 208, 225, 0.95),
+    rgba(255, 95, 170, 0.95)
+  );
+  content: "";
+  inset: -35%;
+  position: absolute;
+  z-index: 0;
+}
+
+.love-image-frame::after {
+  background: linear-gradient(160deg, rgba(23, 11, 33, 0.95), rgba(37, 16, 47, 0.9));
+  border-radius: 14px;
+  content: "";
+  inset: 4px;
+  position: absolute;
+  z-index: 1;
+}
+
 .love-gallery-image {
   animation: love-fade-in 0.55s ease;
-  border: 2px solid rgba(255, 255, 255, 0.2);
+  border: 0;
   border-radius: 14px;
   box-shadow: 0 14px 38px rgba(0, 0, 0, 0.35);
   display: block;
   height: min(56vh, 420px);
   object-fit: cover;
+  position: relative;
   width: min(100%, 520px);
   animation:
     love-fade-in 0.55s ease,
     image-breathe 3.4s ease-in-out infinite;
+  z-index: 2;
 }
 
 .love-gallery-placeholder {
@@ -774,8 +813,10 @@ button:disabled {
   height: 260px;
   justify-content: center;
   padding: 14px;
+  position: relative;
   text-align: center;
   width: 100%;
+  z-index: 2;
 }
 
 .love-caption {
@@ -953,6 +994,15 @@ button:disabled {
     opacity: 0;
     transform: translateY(340px) translateX(var(--drift, 0px))
       rotate(var(--rotation, 420deg)) scale(1);
+  }
+}
+
+@keyframes border-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 
